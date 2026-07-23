@@ -34,6 +34,9 @@ LIB_DIR="$BUILD_DIR/libfprint"
 [ -f "$LIB_DIR/libfprint-2.so.2.0.0" ] \
     || die "libfprint-2.so.2.0.0 not found in $LIB_DIR — did 'meson compile' run?"
 
+command -v nm >/dev/null 2>&1 \
+    || die "'nm' not found — install binutils first (e.g. sudo apt install binutils / sudo pacman -S binutils)"
+
 if ! nm "$LIB_DIR/libfprint-2.so.2.0.0" 2>/dev/null \
         | grep -q "fpi_device_validity_0088_get_type"; then
     die "the libfprint at $LIB_DIR does not include the validity-0088 driver — \
