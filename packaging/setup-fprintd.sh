@@ -37,8 +37,11 @@ LIB_DIR="$BUILD_DIR/libfprint"
 command -v nm >/dev/null 2>&1 \
     || die "'nm' not found — install binutils first (e.g. sudo apt install binutils / sudo pacman -S binutils)"
 
+# NB: no `grep -q` here — under `set -o pipefail`, grep -q exiting at the
+# first match SIGPIPEs nm (exit 141) and the check falsely reports the
+# driver as missing. Plain grep reads all input, so nm exits cleanly.
 if ! nm "$LIB_DIR/libfprint-2.so.2.0.0" 2>/dev/null \
-        | grep -q "fpi_device_validity_0088_get_type"; then
+        | grep "fpi_device_validity_0088_get_type" >/dev/null; then
     die "the libfprint at $LIB_DIR does not include the validity-0088 driver — \
 re-run 'meson setup --wipe builddir -Ddrivers=validity_0088' and rebuild"
 fi
