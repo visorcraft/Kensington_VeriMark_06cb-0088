@@ -36,20 +36,31 @@ The driver compiles into `libfprint-2.so` and is loaded by `libfprint` automatic
 | `nss` (dev)       | Used by libfprint's NBIS minutiae routines      |
 | `openssl` >= 3 (dev) | Used by this driver for AES, HMAC, ECDH      |
 | `pixman` (dev)    | Image scaling used by libfprint                 |
+| `gobject-introspection` (dev) | Hard-required by libfprint's meson (or configure with `-Dintrospection=false`) |
+| `udev`            | Provides `udev.pc`, hard-required by libfprint's meson. Preinstalled on desktop systems; must be installed in minimal environments (containers, chroots, WSL) |
 | `pkg-config`      | Build introspection                             |
 
 On Arch / CachyOS:
 
 ```bash
-sudo pacman -S meson ninja base-devel glib2 libgusb libgudev nss openssl pixman pkgconf
+sudo pacman -S meson ninja base-devel glib2 libgusb libgudev nss openssl pixman pkgconf gobject-introspection
 ```
 
 On Debian / Ubuntu:
 
 ```bash
 sudo apt install meson ninja-build build-essential libglib2.0-dev \
-    libgusb-dev libgudev-1.0-dev libnss3-dev libssl-dev libpixman-1-dev pkg-config
+    libgusb-dev libgudev-1.0-dev libnss3-dev libssl-dev libpixman-1-dev \
+    libgirepository1.0-dev udev pkg-config
 ```
+
+> **Note:** `libgirepository1.0-dev` (Debian/Ubuntu) / `gobject-introspection`
+> (Arch) satisfies libfprint's hard `gobject-introspection-1.0` meson
+> dependency; if you don't want introspection support, you can instead add
+> `-Dintrospection=false` to the `meson setup` line below. The `udev` package
+> provides `udev.pc`, which libfprint's meson also hard-requires — it is
+> preinstalled on desktop systems but missing in minimal environments
+> (containers, chroots, WSL).
 
 ### Build steps
 
