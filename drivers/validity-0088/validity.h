@@ -82,6 +82,12 @@ G_DECLARE_FINAL_TYPE (FpiDeviceValidity0088, fpi_device_validity_0088, FPI, DEVI
 #define VALIDITY_OP_FLASH_WRITE        0x41
 #define VALIDITY_OP_FLASH_SIGN         0x42
 #define VALIDITY_OP_GET_FW_INFO        0x43  /* + 1-byte partition: 0x02 = fwext */
+#define VALIDITY_OP_CAPTURE_STOP       0x04  /* always sent after a capture, success or not */
+#define VALIDITY_OP_ENROLL_TOGGLE      0x69  /* 4B LE param: 1=start enrollment, 0=end */
+#define VALIDITY_OP_ENROLL_UPDATE_START 0x68 /* 4B LE key + 4B LE zero -> 2B status + 4B LE new key */
+#define VALIDITY_OP_ENROLL_UPDATE      0x6B  /* + prev-template bytes -> TLV template/header/tid */
+#define VALIDITY_OP_FLASH_READ         0x40  /* partition(1B)+1(1B)+0(2B)+addr(4B LE)+size(4B LE) */
+#define VALIDITY_OP_GET_FLASH_INFO     0x3E  /* no payload -> partition table (read-only query) */
 
 /* Client-direction prefix on TLS handshake records (NOT on app_data) */
 extern const guint8 validity_client_handshake_prefix[4];  /* = { 0x44, 0x00, 0x00, 0x00 } */
@@ -444,6 +450,45 @@ guint8 *validity_build_enroll_capture_command (FpDevice            *dev,
                                                ValidityCaptureMode  mode,
                                                gsize               *out_len,
                                                GError             **error);
+
+/* Real enrollment-update protocol (ported from python-validity's
+ * Sensor.capture()/enroll() — see fingerprint.prompt.md "Real enrollment
+ * protocol" for the full reference translation). The device builds and
+ * owns the actual fingerprint template; these are not image transfers. */
+guint8 *validity_build_capture_stop_command (gsize *out_len);
+guint8 *validity_build_enroll_toggle_command (guint32 enable, gsize *out_len);
+guint8 *validity_build_enroll_update_start_command (guint32 key, gsize *out_len);
+guint8 *validity_build_enroll_update_command (const guint8 *prev_template,
+                                              gsize         prev_template_len,
+                                              gsize        *out_len);
+
+/* Read-only flash read (opcode 0x40) — used only to check whether
+ * calibration data already exists on partition 6 before enrolling (see
+ * "MAJOR FINDING" / calibration section in fingerprint.prompt.md). No
+ * write path is implemented; if calibration is missing, enrollment fails
+ * with an explanatory error rather than attempting to write anything. */
+guint8 *validity_build_flash_read_command (guint8   partition,
+                                           guint32  addr,
+                                           guint32  size,
+                                           gsize   *out_len);
+
+/* Parsed response to a validity_build_enroll_update_command() exchange.
+ * template_/header_/tid_ point INTO @response (not separately allocated);
+ * valid only as long as @response lives. A non-empty tid means the device
+ * considers the enrollment complete. */
+typedef struct {
+  const guint8 *template_;
+  gsize          template_len;
+  const guint8 *header_;
+  gsize          header_len;
+  const guint8 *tid_;
+  gsize          tid_len;
+} ValidityEnrollUpdateResult;
+
+gboolean validity_parse_enroll_update_response (const guint8               *response,
+                                                gsize                       response_len,
+                                                ValidityEnrollUpdateResult *out,
+                                                GError                    **error);
 
 /* HostPart read/write commands (P5 / PAIRING.md). */
 guint8  *validity_build_host_part_write (gsize *out_len);

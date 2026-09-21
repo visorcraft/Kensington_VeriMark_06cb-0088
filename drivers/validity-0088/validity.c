@@ -38,6 +38,18 @@ struct _FpiDeviceValidity0088
   gint               enroll_completed;
   gint               enroll_attempts;
   gboolean           enroll_needs_scan_setup;
+  gint               read_image_polls;
+
+  /* Real enrollment-update protocol state (see fingerprint.prompt.md "Real
+   * enrollment protocol" — ported from python-validity). "key" and
+   * "template" are threaded through every enrollment_update_start/update
+   * round-trip, growing/changing each tap; only valid while enroll_toggle
+   * is active. */
+  guint32            enroll_key;
+  GByteArray        *enroll_template;   /* accumulated tag-0 TLV record, raw */
+  gboolean           enroll_toggle_active;
+  gboolean           enroll_tid_found;
+  GError            *enroll_retry_error;
 };
 
 G_DEFINE_TYPE (FpiDeviceValidity0088, fpi_device_validity_0088, FP_TYPE_DEVICE);
@@ -237,7 +249,14 @@ validity_validate_status (const gchar  *label,
       return FALSE;
     }
 
-  guint16 status = ((guint16) rsp[0] << 8) | rsp[1];
+  /* Little-endian — confirmed against python-validity's assert_status()
+   * (`unpack('<H', b[:2])`) and matching this driver's own
+   * flash_exchange_status() (validity-pairing.c), which already used LE.
+   * This function used BE instead, meaning every "unexpected status" this
+   * driver has ever logged was byte-swapped: e.g. 0x0104 was really
+   * 0x0401, 0x0600 was really 0x0006, 0xaf04 was really 0x04af. See
+   * fingerprint.prompt.md "MAJOR FINDING" for how this was found. */
+  guint16 status = ((guint16) rsp[0]) | ((guint16) rsp[1] << 8);
   if (status == 0x0000)
     return TRUE;
 
@@ -549,7 +568,8 @@ validity_send_cert_acquisition (FpDevice  *dev,
       return FALSE;
     }
 
-  guint16 status = ((guint16) response[0] << 8) | response[1];
+  /* Little-endian, same fix as validity_validate_status() above. */
+  guint16 status = ((guint16) response[0]) | ((guint16) response[1] << 8);
   if (out_status != NULL)
     *out_status = status;
   if (status != 0x0000)
@@ -1146,6 +1166,14 @@ validity_async_interrupt_cb (FpiUsbTransfer *transfer,
   if (event_len >= 1 && event[0] == 0x02)
     fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
 
+  /* event[0]==0x03 && (event[2]&0x04) is the real "capture complete"
+   * signal — confirmed correct against python-validity's Sensor.capture(),
+   * which waits on this exact bit, unboundedly, with no fallback. An
+   * earlier "fix" here loosened this to accept any 0x03 event, which let
+   * the state machine advance before a real capture had finished — likely
+   * why every subsequent read came back short/invalid. Reverted; the real
+   * gap was the missing enrollment-update opcodes (0x68/0x69/0x6b), not
+   * this check. See fingerprint.prompt.md "MAJOR FINDING". */
   if (event_len >= 3 && event[0] == 0x03 && (event[2] & 0x04))
     {
       fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
@@ -1597,13 +1625,22 @@ validity_verify_ssm_done (FpiSsm   *ssm,
 
 typedef enum {
   ENROLL_S_SESSION_PREP = 0,
-  ENROLL_S_STAGE_BEGIN,
-  ENROLL_S_STAGE_SCAN_SETUP,
-  ENROLL_S_CAPTURE,
-  ENROLL_S_WAIT_TAP,
-  ENROLL_S_READ_IMAGE,
-  ENROLL_S_DETECT_MINUTIAE,
-  ENROLL_S_STAGE_COMMIT,
+  ENROLL_S_GET_FLASH_INFO,         /* 0x3e — read-only partition-table query, primes flash access */
+  ENROLL_S_CHECK_CALIBRATION,      /* 0x40, partition 6 — read-only precondition check */
+  ENROLL_S_TOGGLE_START,           /* 0x69/1 — create_enrollment(), once */
+  ENROLL_S_STAGE_BEGIN,            /* per-tap loop entry */
+  ENROLL_S_STAGE_SCAN_SETUP,       /* 0x39 — glow_start_scan() */
+  ENROLL_S_CAPTURE,                /* 0x02 — capture-program */
+  ENROLL_S_WAIT_TAP,               /* interrupt loop, waits for real 0x03+bit4 */
+  ENROLL_S_CONFIRM_CAPTURE,        /* 0x51/mode=0x2000 — x,y,w1,w2,error, NOT an image */
+  ENROLL_S_CAPTURE_STOP,           /* 0x04 — always sent, success or failure */
+  ENROLL_S_UPDATE_START,           /* 0x68 + key + 0 -> new key */
+  ENROLL_S_UPDATE_START_WAIT_INT,  /* consume exactly one interrupt event, unconditional */
+  ENROLL_S_UPDATE_1,               /* 0x6b + template — result discarded */
+  ENROLL_S_UPDATE_1_WAIT_INT,      /* consume exactly one interrupt event, unconditional */
+  ENROLL_S_UPDATE_2,               /* 0x6b + template — parse TLV: header/template/tid */
+  ENROLL_S_TOGGLE_END,             /* 0x69/0 — enrollment_update_end(), every iteration */
+  ENROLL_S_STAGE_COMMIT,           /* tid found -> done; else -> loop back */
   ENROLL_NUM_STATES,
 } ValidityEnrollState;
 
@@ -1623,85 +1660,251 @@ enroll_bump_attempts_or_fail (FpiSsm *ssm,
 }
 
 static void
-enroll_read_image_cb (FpDevice     *device,
-                      FpiSsm       *ssm,
-                      const guint8 *plain,
-                      gsize         plain_len,
-                      gpointer      user_data)
+validity_async_consume_one_interrupt_cb (FpiUsbTransfer *transfer,
+                                         FpDevice       *device,
+                                         gpointer        userdata,
+                                         GError         *error)
+{
+  FpiSsm *ssm = userdata;
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+
+  {
+    g_autofree gchar *hex = validity_hex_prefix (transfer->buffer,
+                                                 transfer->actual_length,
+                                                 transfer->actual_length);
+    fp_dbg ("interrupt event (unconditional consume) len=%zu data=%s",
+            transfer->actual_length, hex);
+  }
+
+  fpi_ssm_next_state (ssm);
+}
+
+/* Unlike validity_async_submit_interrupt_read(), this does not loop or
+ * match on content — it consumes exactly one event and advances, matching
+ * python-validity's bare `usb.wait_int()` calls (enrollment_update_start,
+ * append_new_image) that don't check what they got. */
+static void
+validity_async_submit_consume_one_interrupt (FpiSsm *ssm, FpDevice *device)
 {
   FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
-  GError *err = NULL;
-  FpImage *image;
+  FpiUsbTransfer *transfer;
 
-  if (plain_len != VALIDITY_IMAGE_RECORD_LEN)
+  transfer = fpi_usb_transfer_new (device);
+  fpi_usb_transfer_fill_interrupt (transfer, VALIDITY_EP_INT_IN, 64);
+  fpi_usb_transfer_submit (transfer, VALIDITY_USB_INTERRUPT_TIMEOUT,
+                           self->interrupt_cancellable,
+                           validity_async_consume_one_interrupt_cb, ssm);
+}
+
+/* Response to 0x51/mode=0x2000 (the real meaning of this opcode — see
+ * fingerprint.prompt.md "MAJOR FINDING"). Layout after the already-
+ * validated 2-byte status: 4B LE length(=12), then x/y/w1/w2 (u16 LE
+ * each), then a u32 LE "error" — a small confirmation tuple, never image
+ * data. Non-zero error is a soft/retryable scan-quality problem, not a
+ * protocol error, so this never marks the ssm failed itself — it always
+ * proceeds to CAPTURE_STOP (matching python's `finally`), stashing any
+ * problem in self->enroll_retry_error for ENROLL_S_STAGE_COMMIT to act on
+ * once cleanup has actually run. */
+static void
+enroll_confirm_capture_cb (FpDevice     *device,
+                           FpiSsm       *ssm,
+                           const guint8 *plain,
+                           gsize         plain_len,
+                           gpointer      user_data)
+{
+  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
+  guint32 scan_error;
+
+  if (plain_len < 18)
     {
       g_autofree gchar *hex = validity_hex_prefix (plain, plain_len, 32);
-      g_autoptr(GError) retry = g_error_new (FP_DEVICE_RETRY,
+      self->enroll_retry_error = g_error_new (FP_DEVICE_RETRY,
           FP_DEVICE_RETRY_TOO_SHORT,
-          "device did not return an image (%zu B: %s)", plain_len, hex);
-      fp_dbg ("enroll capture retry: %s", retry->message);
-      fpi_device_enroll_progress (device, self->enroll_completed, NULL,
-                                  g_steal_pointer (&retry));
-      self->enroll_needs_scan_setup = TRUE;
-      if (!enroll_bump_attempts_or_fail (ssm, self))
-        return;
-      fpi_ssm_jump_to_state (ssm, ENROLL_S_STAGE_BEGIN);
+          "confirm-capture response too short (%zu B: %s)", plain_len, hex);
+      fpi_ssm_next_state (ssm);
       return;
     }
 
-  image = validity_image_from_plaintext (plain, plain_len, &err);
-  if (image == NULL)
-    {
-      fpi_ssm_mark_failed (ssm, err);
-      return;
-    }
+  scan_error = (guint32) plain[14]
+             | ((guint32) plain[15] << 8)
+             | ((guint32) plain[16] << 16)
+             | ((guint32) plain[17] << 24);
 
-  g_clear_object (&self->captured_image);
-  self->captured_image = image;
-  fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
+  fp_dbg ("confirm-capture: x=%u y=%u w1=%u w2=%u error=0x%08x",
+          (guint) (plain[6]  | (plain[7]  << 8)),
+          (guint) (plain[8]  | (plain[9]  << 8)),
+          (guint) (plain[10] | (plain[11] << 8)),
+          (guint) (plain[12] | (plain[13] << 8)),
+          scan_error);
+
+  if (scan_error != 0)
+    self->enroll_retry_error = fpi_device_retry_new_msg (
+        FP_DEVICE_RETRY_GENERAL, "Scanning problem: 0x%04x", scan_error);
+
   fpi_ssm_next_state (ssm);
 }
 
 static void
-enroll_detect_minutiae_cb (GObject      *source,
-                           GAsyncResult *res,
-                           gpointer      user_data)
+enroll_capture_stop_cb (FpDevice     *device,
+                        FpiSsm       *ssm,
+                        const guint8 *plain,
+                        gsize         plain_len,
+                        gpointer      user_data)
 {
-  FpDevice *device = user_data;
   FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
-  g_autoptr(FpPrint) print = NULL;
+  (void) plain;
+  (void) plain_len;
+  (void) user_data;
+
+  /* If confirm-capture flagged a problem, skip the update calls entirely
+   * (python's exception path never reaches enrollment_update_start/
+   * append_new_image either) and go straight to the per-iteration
+   * cleanup. */
+  if (self->enroll_retry_error != NULL)
+    fpi_ssm_jump_to_state (ssm, ENROLL_S_TOGGLE_END);
+  else
+    fpi_ssm_next_state (ssm);
+}
+
+static void
+enroll_update_start_cb (FpDevice     *device,
+                        FpiSsm       *ssm,
+                        const guint8 *plain,
+                        gsize         plain_len,
+                        gpointer      user_data)
+{
+  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
+
+  if (plain_len < 6)
+    {
+      fpi_ssm_mark_failed (ssm,
+          fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                    "enroll-update-start response too short: %zu B",
+                                    plain_len));
+      return;
+    }
+
+  self->enroll_key = (guint32) plain[2]
+                   | ((guint32) plain[3] << 8)
+                   | ((guint32) plain[4] << 16)
+                   | ((guint32) plain[5] << 24);
+  fp_dbg ("enroll-update-start: new key=0x%08x", (guint) self->enroll_key);
+  fpi_ssm_next_state (ssm);
+}
+
+/* Parses the SECOND 0x6b response (the first is sent purely for its side
+ * effect and discarded, per python-validity). tid_len > 0 means the
+ * device itself has decided enrollment is complete — not a fixed tap
+ * count on our side. */
+static void
+enroll_update_2_cb (FpDevice     *device,
+                    FpiSsm       *ssm,
+                    const guint8 *plain,
+                    gsize         plain_len,
+                    gpointer      user_data)
+{
+  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
+  ValidityEnrollUpdateResult parsed;
   GError *err = NULL;
 
-  if (!fp_image_detect_minutiae_finish (FP_IMAGE (source), res, &err))
+  if (plain_len < 2 ||
+      !validity_parse_enroll_update_response (plain + 2, plain_len - 2,
+                                              &parsed, &err))
     {
-      fp_dbg ("enroll minutiae retry: %s",
-              err ? err->message : "unknown");
-      g_clear_error (&err);
-      fpi_device_enroll_progress (device, self->enroll_completed, NULL,
-          fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL,
-                                    "Minutiae detection failed, please retry"));
-      self->enroll_needs_scan_setup = TRUE;
-      if (!enroll_bump_attempts_or_fail (self->task_ssm, self))
-        return;
-      fpi_ssm_jump_to_state (self->task_ssm, ENROLL_S_STAGE_BEGIN);
+      fpi_ssm_mark_failed (ssm, err ? err :
+          fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                    "enroll-update: malformed response"));
       return;
     }
 
-  fp_dbg ("NBIS minutiae extracted: %u",
-          fp_image_get_minutiae (self->captured_image) ?
-          fp_image_get_minutiae (self->captured_image)->len : 0);
-
-  print = fp_print_new (device);
-  fpi_print_set_type (print, FPI_PRINT_NBIS);
-  if (!fpi_print_add_from_image (print, self->captured_image, &err))
+  if (parsed.template_len > 0)
     {
-      fpi_ssm_mark_failed (self->task_ssm, err);
+      g_byte_array_set_size (self->enroll_template, 0);
+      g_byte_array_append (self->enroll_template, parsed.template_,
+                           parsed.template_len);
+    }
+
+  if (parsed.tid_len > 0)
+    {
+      fp_dbg ("enroll-update: device reports enrollment COMPLETE (tid %zu B)",
+              parsed.tid_len);
+      self->enroll_tid_found = TRUE;
+    }
+  else
+    {
+      fp_dbg ("enroll-update: tap accepted, %u B template accumulated",
+              self->enroll_template->len);
+    }
+
+  fpi_ssm_next_state (ssm);
+}
+
+/* Read-only precondition check (opcode 0x40, partition 6) — python-validity's
+ * Sensor.calibrate()/check_clean_slate() found enrollment/capture requires
+ * valid calibration data on this partition first. This ONLY reads; there is
+ * deliberately no write path here (see fingerprint.prompt.md "calibration"
+ * section — flash writes need separate explicit approval). If calibration
+ * is missing, enrollment fails with an explanatory error instead of
+ * attempting to write fresh calibration data. */
+static void
+enroll_check_calibration_cb (FpDevice     *device,
+                             FpiSsm       *ssm,
+                             const guint8 *plain,
+                             gsize         plain_len,
+                             gpointer      user_data)
+{
+  guint16 status;
+  guint32 data_len;
+  guint16 magic;
+
+  /* check_status=FALSE here — see the call site comment. plain includes
+   * the 2-byte status prefix, unvalidated. */
+  if (plain_len < 2)
+    {
+      fp_warn ("calibration check: response too short (%zu B), proceeding anyway",
+               plain_len);
+      fpi_ssm_next_state (ssm);
       return;
     }
 
-  g_clear_object (&self->stage_print);
-  self->stage_print = g_steal_pointer (&print);
-  fpi_ssm_next_state (self->task_ssm);
+  status = (guint16) plain[0] | ((guint16) plain[1] << 8);
+  if (status != 0x0000)
+    {
+      fp_warn ("calibration check: partition 6 read rejected (status 0x%04x) — "
+               "proceeding anyway to see if this actually blocks enrollment",
+               (guint) status);
+      fpi_ssm_next_state (ssm);
+      return;
+    }
+
+  if (plain_len < 10)
+    {
+      fp_warn ("calibration check: OK status but data too short (%zu B), proceeding anyway",
+               plain_len);
+      fpi_ssm_next_state (ssm);
+      return;
+    }
+
+  data_len = (guint32) plain[2]
+           | ((guint32) plain[3] << 8)
+           | ((guint32) plain[4] << 16)
+           | ((guint32) plain[5] << 24);
+  (void) data_len;
+
+  magic = (guint16) plain[8] | ((guint16) plain[9] << 8);
+  fp_dbg ("calibration check: partition 6 magic=0x%04x (0x5002 = valid calibration present)",
+          (guint) magic);
+
+  if (magic != 0x5002)
+    fp_warn ("calibration check: unexpected magic 0x%04x (expected 0x5002), "
+             "proceeding anyway", (guint) magic);
+
+  fpi_ssm_next_state (ssm);
 }
 
 static void
@@ -1716,11 +1919,52 @@ validity_enroll_run_state (FpiSsm   *ssm,
       validity_start_session_prep (device);
       break;
 
+    case ENROLL_S_GET_FLASH_INFO:
+      {
+        gsize cmd_len;
+        g_autofree guint8 *cmd =
+            validity_wrap_wire_frame (VALIDITY_OP_GET_FLASH_INFO, NULL, 0, &cmd_len);
+        /* Read-only partition-table query (python-validity's
+         * get_flash_info()). We don't need the parsed table, just to send
+         * it — per init_flash(), this is the step normally run before any
+         * other flash access; skipping straight to a partition read may be
+         * why check-calibration alone was rejected (status 0x04af). */
+        validity_ssm_exchange (ssm, device, "get-flash-info",
+                               cmd, cmd_len, TRUE, NULL, NULL);
+      }
+      break;
+
+    case ENROLL_S_CHECK_CALIBRATION:
+      {
+        gsize cmd_len;
+        g_autofree guint8 *cmd =
+            validity_build_flash_read_command (6, 0, 0x44, &cmd_len);
+        /* check_status=FALSE: experimentally advisory-only for now (see
+         * fingerprint.prompt.md) — a rejected read here (0x04af) may or
+         * may not actually block enrollment; logging it and proceeding
+         * anyway tells us whether the real blocker is downstream. */
+        validity_ssm_exchange (ssm, device, "check-calibration",
+                               cmd, cmd_len, FALSE,
+                               enroll_check_calibration_cb, NULL);
+      }
+      break;
+
+    case ENROLL_S_TOGGLE_START:
+      {
+        gsize cmd_len;
+        g_autofree guint8 *cmd = validity_build_enroll_toggle_command (1, &cmd_len);
+        self->enroll_key = 0;
+        g_byte_array_set_size (self->enroll_template, 0);
+        self->enroll_toggle_active = TRUE;
+        validity_ssm_exchange (ssm, device, "enroll-toggle-start",
+                               cmd, cmd_len, TRUE, NULL, NULL);
+      }
+      break;
+
     case ENROLL_S_STAGE_BEGIN:
-      if (self->enroll_needs_scan_setup)
-        fpi_ssm_next_state (ssm);
-      else
-        fpi_ssm_jump_to_state (ssm, ENROLL_S_CAPTURE);
+      g_clear_error (&self->enroll_retry_error);
+      self->enroll_tid_found = FALSE;
+      fpi_ssm_next_state (ssm);
       break;
 
     case ENROLL_S_STAGE_SCAN_SETUP:
@@ -1743,8 +1987,8 @@ validity_enroll_run_state (FpiSsm   *ssm,
             validity_build_enroll_capture_command (
                 device, VALIDITY_CAPTURE_MODE_ENROLL, &cmd_len, &err);
         if (cmd == NULL) { fpi_ssm_mark_failed (ssm, err); return; }
-        fp_dbg ("enroll stage %d/%d: send capture program",
-                self->enroll_completed + 1, VALIDITY_MAX_ENROLL_STAGES);
+        fp_dbg ("enroll: send capture program (attempt %d)",
+                self->enroll_attempts + 1);
         validity_ssm_exchange (ssm, device, "enroll-capture",
                                cmd, cmd_len, TRUE,
                                validity_capture_response_cb, NULL);
@@ -1756,41 +2000,123 @@ validity_enroll_run_state (FpiSsm   *ssm,
       validity_async_submit_interrupt_read (ssm, device);
       break;
 
-    case ENROLL_S_READ_IMAGE:
+    case ENROLL_S_CONFIRM_CAPTURE:
       {
         gsize cmd_len;
         g_autofree guint8 *cmd =
             validity_build_enroll_read_image_command (0x2000, &cmd_len);
-        validity_ssm_exchange (ssm, device, "enroll-read-image",
+        validity_ssm_exchange (ssm, device, "enroll-confirm-capture",
                                cmd, cmd_len, TRUE,
-                               enroll_read_image_cb, NULL);
+                               enroll_confirm_capture_cb, NULL);
       }
       break;
 
-    case ENROLL_S_DETECT_MINUTIAE:
-      fp_image_detect_minutiae (self->captured_image,
-                                fpi_device_get_cancellable (device),
-                                enroll_detect_minutiae_cb, device);
+    case ENROLL_S_CAPTURE_STOP:
+      {
+        gsize cmd_len;
+        g_autofree guint8 *cmd = validity_build_capture_stop_command (&cmd_len);
+        validity_ssm_exchange (ssm, device, "enroll-capture-stop",
+                               cmd, cmd_len, TRUE,
+                               enroll_capture_stop_cb, NULL);
+      }
+      break;
+
+    case ENROLL_S_UPDATE_START:
+      {
+        gsize cmd_len;
+        g_autofree guint8 *cmd =
+            validity_build_enroll_update_start_command (self->enroll_key, &cmd_len);
+        validity_ssm_exchange (ssm, device, "enroll-update-start",
+                               cmd, cmd_len, TRUE,
+                               enroll_update_start_cb, NULL);
+      }
+      break;
+
+    case ENROLL_S_UPDATE_START_WAIT_INT:
+      validity_async_submit_consume_one_interrupt (ssm, device);
+      break;
+
+    case ENROLL_S_UPDATE_1:
+      {
+        gsize cmd_len;
+        g_autofree guint8 *cmd =
+            validity_build_enroll_update_command (self->enroll_template->data,
+                                                  self->enroll_template->len,
+                                                  &cmd_len);
+        validity_ssm_exchange (ssm, device, "enroll-update-1",
+                               cmd, cmd_len, TRUE, NULL, NULL);
+      }
+      break;
+
+    case ENROLL_S_UPDATE_1_WAIT_INT:
+      validity_async_submit_consume_one_interrupt (ssm, device);
+      break;
+
+    case ENROLL_S_UPDATE_2:
+      {
+        gsize cmd_len;
+        g_autofree guint8 *cmd =
+            validity_build_enroll_update_command (self->enroll_template->data,
+                                                  self->enroll_template->len,
+                                                  &cmd_len);
+        validity_ssm_exchange (ssm, device, "enroll-update-2",
+                               cmd, cmd_len, TRUE,
+                               enroll_update_2_cb, NULL);
+      }
+      break;
+
+    case ENROLL_S_TOGGLE_END:
+      {
+        gsize cmd_len;
+        g_autofree guint8 *cmd = validity_build_enroll_toggle_command (0, &cmd_len);
+        validity_ssm_exchange (ssm, device, "enroll-toggle-end",
+                               cmd, cmd_len, TRUE, NULL, NULL);
+      }
       break;
 
     case ENROLL_S_STAGE_COMMIT:
       {
-        FpPrint *enroll_print = NULL;
+        if (self->enroll_retry_error != NULL)
+          {
+            GError *retry = g_steal_pointer (&self->enroll_retry_error);
+            fp_dbg ("enroll stage retry: %s", retry->message);
+            fpi_device_enroll_progress (device, self->enroll_completed, NULL, retry);
+            if (!enroll_bump_attempts_or_fail (ssm, self))
+              return;
+            fpi_ssm_jump_to_state (ssm, ENROLL_S_STAGE_BEGIN);
+            return;
+          }
 
-        fpi_device_get_enroll_data (device, &enroll_print);
-        fpi_print_add_print (enroll_print, self->stage_print);
         self->enroll_completed++;
-        fp_dbg ("enroll stage %d/%d accepted",
-                self->enroll_completed, VALIDITY_MAX_ENROLL_STAGES);
-        fpi_device_enroll_progress (device, self->enroll_completed,
-                                    g_steal_pointer (&self->stage_print),
-                                    NULL);
-        self->enroll_needs_scan_setup = TRUE;
+        fp_dbg ("enroll: tap %d accepted (tid_found=%d)",
+                self->enroll_completed, self->enroll_tid_found);
+        fpi_device_enroll_progress (device, self->enroll_completed, NULL, NULL);
 
-        if (self->enroll_completed < VALIDITY_MAX_ENROLL_STAGES)
-          fpi_ssm_jump_to_state (ssm, ENROLL_S_STAGE_BEGIN);
+        if (self->enroll_tid_found)
+          {
+            FpPrint *enroll_print = NULL;
+            GVariant *fpi_data;
+
+            fpi_device_get_enroll_data (device, &enroll_print);
+            fpi_print_set_type (enroll_print, FPI_PRINT_RAW);
+            fpi_print_set_device_stored (enroll_print, TRUE);
+
+            fpi_data = g_variant_new ("(@ay)",
+                g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
+                                          self->enroll_template->data,
+                                          self->enroll_template->len,
+                                          sizeof (guint8)));
+            g_object_set (enroll_print, "fpi-data", fpi_data, NULL);
+
+            self->enroll_toggle_active = FALSE;
+            fpi_ssm_mark_completed (ssm);
+          }
         else
-          fpi_ssm_mark_completed (ssm);
+          {
+            if (!enroll_bump_attempts_or_fail (ssm, self))
+              return;
+            fpi_ssm_jump_to_state (ssm, ENROLL_S_STAGE_BEGIN);
+          }
       }
       break;
 
@@ -2080,6 +2406,7 @@ validity_enroll (FpDevice *device)
   self->enroll_completed = 0;
   self->enroll_attempts = 0;
   self->enroll_needs_scan_setup = FALSE;
+  self->read_image_polls = 0;
 
   fp_dbg ("starting validity-0088 async enrollment");
 
@@ -2152,6 +2479,7 @@ fpi_device_validity_0088_init (FpiDeviceValidity0088 *self)
   validity_session_clear_fresh_pair (&self->session);
   memset (&self->session, 0, sizeof (self->session));
   self->phase = VALIDITY_PHASE_PLAINTEXT_INIT;
+  self->enroll_template = g_byte_array_new ();
 }
 
 static void
