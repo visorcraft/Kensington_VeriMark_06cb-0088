@@ -244,6 +244,177 @@ validity_build_enroll_read_image_command (guint32 mode,
 }
 
 /* ===========================================================================
+ * Real enrollment-update protocol (ported from python-validity)
+ *
+ * See fingerprint.prompt.md "Real enrollment protocol" for the reference
+ * translation this is built from. 0x51/mode=0x2000 (above) is only a scan
+ * status confirmation, not an image transfer — the actual per-tap template
+ * data comes from these opcodes instead.
+ * ========================================================================= */
+
+guint8 *
+validity_build_capture_stop_command (gsize *out_len)
+{
+  return validity_wrap_wire_frame (VALIDITY_OP_CAPTURE_STOP, NULL, 0, out_len);
+}
+
+guint8 *
+validity_build_enroll_toggle_command (guint32 enable, gsize *out_len)
+{
+  guint8 payload[4];
+
+  payload[0] = enable & 0xff;
+  payload[1] = (enable >> 8) & 0xff;
+  payload[2] = (enable >> 16) & 0xff;
+  payload[3] = (enable >> 24) & 0xff;
+
+  return validity_wrap_wire_frame (VALIDITY_OP_ENROLL_TOGGLE,
+                                   payload, sizeof (payload), out_len);
+}
+
+guint8 *
+validity_build_enroll_update_start_command (guint32 key, gsize *out_len)
+{
+  guint8 payload[8];
+
+  payload[0] = key & 0xff;
+  payload[1] = (key >> 8) & 0xff;
+  payload[2] = (key >> 16) & 0xff;
+  payload[3] = (key >> 24) & 0xff;
+  payload[4] = 0;
+  payload[5] = 0;
+  payload[6] = 0;
+  payload[7] = 0;
+
+  return validity_wrap_wire_frame (VALIDITY_OP_ENROLL_UPDATE_START,
+                                   payload, sizeof (payload), out_len);
+}
+
+guint8 *
+validity_build_enroll_update_command (const guint8 *prev_template,
+                                      gsize         prev_template_len,
+                                      gsize        *out_len)
+{
+  return validity_wrap_wire_frame (VALIDITY_OP_ENROLL_UPDATE,
+                                   prev_template, prev_template_len, out_len);
+}
+
+/* Response layout (from python-validity's append_new_image, "magic_len =
+ * 0x38 hardcoded in the DLL"): [2B LE total-len][TLV records], each record
+ * = [2B LE tag][2B LE val_len][0x38-4=0x34 B unparsed sub-header][val_len B
+ * value], i.e. 0x38+val_len bytes per record regardless of tag. Tag 0
+ * ("template") is kept as the FULL raw record (header+subheader+value) —
+ * it gets replayed byte-for-byte as the next round's prev-template, never
+ * interpreted. Tags 1/3 ("header"/"tid") are exposed as just the value
+ * portion, skipping the fixed 0x38-byte prefix. */
+gboolean
+validity_parse_enroll_update_response (const guint8               *response,
+                                       gsize                       response_len,
+                                       ValidityEnrollUpdateResult *out,
+                                       GError                    **error)
+{
+  guint16 declared_len;
+  const guint8 *res;
+  gsize res_len;
+
+  memset (out, 0, sizeof (*out));
+
+  if (response_len < 2)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                   "enroll-update response too short: %zu B", response_len);
+      return FALSE;
+    }
+
+  declared_len = (guint16) response[0] | ((guint16) response[1] << 8);
+  res = response + 2;
+  res_len = response_len - 2;
+
+  if (declared_len != res_len)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                   "enroll-update length mismatch: declared %u, got %zu",
+                   (guint) declared_len, res_len);
+      return FALSE;
+    }
+
+  while (res_len > 0)
+    {
+      guint16 tag, val_len;
+      gsize record_len;
+
+      if (res_len < 4)
+        {
+          g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                       "enroll-update: truncated TLV record header (%zu B left)",
+                       res_len);
+          return FALSE;
+        }
+
+      tag     = (guint16) res[0] | ((guint16) res[1] << 8);
+      val_len = (guint16) res[2] | ((guint16) res[3] << 8);
+      record_len = 0x38 + (gsize) val_len;
+
+      if (record_len > res_len)
+        {
+          g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                       "enroll-update: TLV record (tag %u, %zu B) overruns "
+                       "remaining %zu B", (guint) tag, record_len, res_len);
+          return FALSE;
+        }
+
+      switch (tag)
+        {
+        case 0:
+          out->template_ = res;
+          out->template_len = record_len;
+          break;
+        case 1:
+          out->header_ = res + 0x38;
+          out->header_len = val_len;
+          break;
+        case 3:
+          out->tid_ = res + 0x38;
+          out->tid_len = val_len;
+          break;
+        default:
+          fp_warn ("enroll-update: ignoring unknown TLV tag %u", (guint) tag);
+          break;
+        }
+
+      res += record_len;
+      res_len -= record_len;
+    }
+
+  return TRUE;
+}
+
+guint8 *
+validity_build_flash_read_command (guint8   partition,
+                                   guint32  addr,
+                                   guint32  size,
+                                   gsize   *out_len)
+{
+  guint8 payload[12];
+
+  payload[0] = partition;
+  payload[1] = 1;
+  payload[2] = 0;
+  payload[3] = 0;
+  payload[4] = addr & 0xff;
+  payload[5] = (addr >> 8) & 0xff;
+  payload[6] = (addr >> 16) & 0xff;
+  payload[7] = (addr >> 24) & 0xff;
+  payload[8]  = size & 0xff;
+  payload[9]  = (size >> 8) & 0xff;
+  payload[10] = (size >> 16) & 0xff;
+  payload[11] = (size >> 24) & 0xff;
+
+  return validity_wrap_wire_frame (VALIDITY_OP_FLASH_READ,
+                                   payload, sizeof (payload), out_len);
+}
+
+/* ===========================================================================
  * SPI flash commands (Phase 7 / FINISH_PAIRING.md)
  *
  * Decompiled references:
@@ -468,14 +639,18 @@ validity_build_enroll_capture_command (FpDevice            *dev,
 #define LED_PAYLOAD_LEN        (1 + 4 + LED_NUM_SLOTS * LED_SLOT_SIZE)  /* = 125 */
 /* LED_MODE_STEADY / LED_MODE_SOLID / LED_MODE_REPEAT are defined in validity.h */
 
+/* Fixed 2026-09-20: 6 bytes differed from python-validity's glow_start_scan()
+ * (offsets 10,17,18,21,22,50 — 0xbf vs 0x99, plus one 0x00 pair swap at
+ * 21/22) despite this driver's own comment claiming equivalence. Corrected
+ * to match the reference exactly; see fingerprint.prompt.md. */
 static const guint8 led_blue_scan_setup_template[LED_PAYLOAD_LEN] = {
   0x39, 0x20, 0xbf, 0x02, 0x00, 0xff, 0xff, 0x00,
-  0x00, 0x01, 0xbf, 0x00, 0x20, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0xbf, 0xbf, 0x00,
+  0x00, 0x01, 0x99, 0x00, 0x20, 0x00, 0x00, 0x00,
+  0x00, 0x99, 0x99, 0x00, 0x00, 0x00, 0x00, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00,
-  0x00, 0x00, 0xbf, 0x00, 0x20, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x99, 0x00, 0x20, 0x00, 0x00, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
