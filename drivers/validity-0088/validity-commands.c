@@ -173,52 +173,6 @@ validity_build_client_hello (ValiditySession *session, gsize *out_len)
  * Total wire frame = 1 (opcode) + 12 (header) + payload_len.
  * ========================================================================= */
 
-guint8 *
-validity_build_identify_command (guint8        flag1,
-                                 guint8        flag2,
-                                 guint16       field_a,
-                                 guint16       field_b,
-                                 guint16       field_c,
-                                 const guint8 *payload,
-                                 guint32       payload_len,
-                                 gsize        *out_len)
-{
-  gsize body_len = 12 + payload_len;
-  guint8 *body = g_malloc (body_len);
-  guint8 *p = body;
-
-  *p++ = flag1;
-  *p++ = flag2;
-  /* uint16/uint32 fields are little-endian per FUN_180080df0 */
-  *p++ = field_a & 0xff;
-  *p++ = (field_a >> 8) & 0xff;
-  *p++ = field_b & 0xff;
-  *p++ = (field_b >> 8) & 0xff;
-  *p++ = field_c & 0xff;
-  *p++ = (field_c >> 8) & 0xff;
-  *p++ = payload_len & 0xff;
-  *p++ = (payload_len >> 8) & 0xff;
-  *p++ = (payload_len >> 16) & 0xff;
-  *p++ = (payload_len >> 24) & 0xff;
-  if (payload_len > 0)
-    memcpy (p, payload, payload_len);
-
-  guint8 *wire = validity_wrap_wire_frame (
-      VALIDITY_OP_IDENTIFY_MATCH, body, body_len, out_len);
-  g_free (body);
-  return wire;
-}
-
-/* Build the enroll-begin command (wire byte 0x50). Per user RE doc
- * FUN_1800507f0, this is a 1-byte wire command with no payload —
- * literally just [0x50]. The device responds with a 2-byte status
- * word (read by the caller). */
-guint8 *
-validity_build_enroll_begin_command (gsize *out_len)
-{
-  return validity_wrap_wire_frame (VALIDITY_OP_ENROLL_BEGIN, NULL, 0, out_len);
-}
-
 /* Build the enroll-session-start command (wire byte 0x1A). Per
  * and the live capture-03 trace, sent BEFORE 0x50 when
  * starting an enrollment flow. 1-byte wire, like 0x50. */
@@ -546,35 +500,6 @@ validity_build_led_glow_command (guint8  r,
   buf[10] = r;
   buf[11] = g;
   buf[12] = b;
-
-  *out_len = LED_PAYLOAD_LEN;
-  return buf;
-}
-
-/* Raw-payload override: parse a hex string into a 125-byte payload.
- * Used by VALIDITY0088_LED_RAW_PAYLOAD env var for live experimentation.
- * Returns NULL if the hex is malformed or doesn't decode to exactly 125 bytes.
- */
-guint8 *
-validity_parse_led_raw_payload (const gchar *hex_str,
-                                gsize       *out_len)
-{
-  gsize hex_len = strlen (hex_str);
-  if (hex_len != LED_PAYLOAD_LEN * 2)
-    return NULL;
-
-  guint8 *buf = g_malloc (LED_PAYLOAD_LEN);
-  for (gsize i = 0; i < LED_PAYLOAD_LEN; i++)
-    {
-      gint hi = g_ascii_xdigit_value (hex_str[i * 2]);
-      gint lo = g_ascii_xdigit_value (hex_str[i * 2 + 1]);
-      if (hi < 0 || lo < 0)
-        {
-          g_free (buf);
-          return NULL;
-        }
-      buf[i] = (guint8) ((hi << 4) | lo);
-    }
 
   *out_len = LED_PAYLOAD_LEN;
   return buf;

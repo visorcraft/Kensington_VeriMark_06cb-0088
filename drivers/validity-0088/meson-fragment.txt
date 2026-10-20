@@ -18,13 +18,21 @@
 ;         'drivers/validity-0088/validity-enroll-data.c',
 ;         'drivers/validity-0088/validity-pairing.c',
 ;         'drivers/validity-0088/validity-pretls-pair.c',
-;         'drivers/validity-0088/validity-pubkeys.c' ],
+;         'drivers/validity-0088/validity-printkey.c',
+;         'drivers/validity-0088/validity-transport.c',
+;         'drivers/validity-0088/validity-match.c',
+;         'drivers/validity-0088/validity-pubkeys.c',
+;         'drivers/validity-0088/validity-sift.c' ],
 ;
 ; ---------------------------------------------------------------------------
 ; 2) libfprint/meson.build  (the OUTER one, in the project root)
 ;
-;    Add to the `driver_helper_mapping` dictionary so the driver gets
-;    linked against libcrypto:
+;    Current libfprint: add to the `drivers_info` dictionary so the driver
+;    gets linked against libcrypto:
+;
+;   'validity_0088' : { 'helper': ['openssl'] },
+;
+;    Older libfprint trees use a `driver_helper_mapping` dictionary instead:
 ;
 ;   'validity_0088' : [ 'openssl' ],
 ;

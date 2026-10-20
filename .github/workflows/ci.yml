@@ -1,0 +1,90 @@
+# CI: build libfprint with the validity-0088 driver on several distributions
+# and run the tests (no device needed). See docs/testing.md.
+#
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # weekly, to notice new libfprint releases and upstream breakage
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S warning packaging/*.sh tests/*.sh .github/ci/*.sh
+      - name: Repository rules
+        run: tests/check-repo.sh
+
+  build-and-test:
+    name: ${{ matrix.image }} / libfprint ${{ matrix.libfprint }}
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - "ubuntu:24.04"
+          - "debian:12"
+          - "debian:13"
+          - "fedora:42"
+          # Rocky publishes its images under rockylinux/rockylinux (the
+          # official "rockylinux" image stops at 9)
+          - "rockylinux/rockylinux:9"
+          - "rockylinux/rockylinux:10"
+        libfprint: [release]
+        experimental: [false]
+        include:
+          # upstream development branch: an early warning, allowed to fail
+          - image: "ubuntu:24.04"
+            libfprint: master
+            experimental: true
+    steps:
+      - name: Prepare container
+        # bash and the scripts are not in the container before checkout
+        run: |
+          if command -v apt-get >/dev/null; then apt-get update -q && apt-get install -y -q git ca-certificates; \
+          else dnf install -y -q git; fi
+      - uses: actions/checkout@v4
+      - name: Base packages
+        run: .github/ci/prepare-container.sh
+      - name: Build libfprint with the driver
+        run: |
+          if [ "${{ matrix.libfprint }}" = release ]; then
+            packaging/build-libfprint.sh --install-deps
+          else
+            packaging/build-libfprint.sh --install-deps --ref "${{ matrix.libfprint }}"
+          fi
+      - name: No compiler warnings in the driver
+        run: |
+          if grep "validity-0088/.*warning:" build/meson-compile.log; then
+            echo "::error::the driver compiles with warnings"; exit 1
+          fi
+      - name: Tests
+        run: tests/run.sh
+      - name: Logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ strategy.job-index }}
+          path: |
+            build/*.log
+            build/tests/*.log
+          if-no-files-found: ignore

@@ -48,6 +48,8 @@
 #include <openssl/ecdsa.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <openssl/obj_mac.h>
+#include <openssl/param_build.h>
 #include <openssl/pem.h>
 #include <openssl/sha.h>
 
@@ -111,57 +113,47 @@ compute_hs_key (guint8 hs_key_le[32])
                         hs_key_le, 32);
 }
 
-/* Build an EVP_PKEY from a BE-encoded 32-byte EC P-256 private scalar. */
+/* Build an EVP_PKEY (private + public part) from a BE-encoded 32-byte EC
+ * P-256 private scalar, with the OpenSSL 3 provider API: the public point
+ * is d * G, passed together with d to EVP_PKEY_fromdata(). */
 static EVP_PKEY *
 ec_pkey_from_scalar_be (const guint8 scalar_be[32], GError **error)
 {
-  EC_KEY *ec = EC_KEY_new_by_curve_name (NID_X9_62_prime256v1);
-  if (!ec) goto fail;
-
+  EC_GROUP *group = EC_GROUP_new_by_curve_name (NID_X9_62_prime256v1);
   BIGNUM *d = BN_bin2bn (scalar_be, 32, NULL);
-  if (!d) goto fail;
+  EC_POINT *pub = group ? EC_POINT_new (group) : NULL;
+  OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new ();
+  OSSL_PARAM *params = NULL;
+  EVP_PKEY_CTX *ctx = NULL;
+  EVP_PKEY *pkey = NULL;
+  guint8 pub_oct[65];
 
-  if (!EC_KEY_set_private_key (ec, d))
+  if (!group || !d || !pub || !bld ||
+      !EC_POINT_mul (group, pub, d, NULL, NULL, NULL) ||
+      EC_POINT_point2oct (group, pub, POINT_CONVERSION_UNCOMPRESSED,
+                          pub_oct, sizeof (pub_oct), NULL) != sizeof (pub_oct) ||
+      !OSSL_PARAM_BLD_push_utf8_string (bld, OSSL_PKEY_PARAM_GROUP_NAME,
+                                        SN_X9_62_prime256v1, 0) ||
+      !OSSL_PARAM_BLD_push_BN (bld, OSSL_PKEY_PARAM_PRIV_KEY, d) ||
+      !OSSL_PARAM_BLD_push_octet_string (bld, OSSL_PKEY_PARAM_PUB_KEY,
+                                         pub_oct, sizeof (pub_oct)) ||
+      (params = OSSL_PARAM_BLD_to_param (bld)) == NULL ||
+      (ctx = EVP_PKEY_CTX_new_from_name (NULL, "EC", NULL)) == NULL ||
+      EVP_PKEY_fromdata_init (ctx) <= 0 ||
+      EVP_PKEY_fromdata (ctx, &pkey, EVP_PKEY_KEYPAIR, params) <= 0)
     {
-      BN_free (d);
-      goto fail;
+      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                           "failed to build EC key from scalar");
+      pkey = NULL;
     }
 
-  /* Compute the public point */
-  const EC_GROUP *group = EC_KEY_get0_group (ec);
-  EC_POINT *pub = EC_POINT_new (group);
-  if (!pub) { BN_free (d); goto fail; }
-  if (!EC_POINT_mul (group, pub, d, NULL, NULL, NULL))
-    {
-      EC_POINT_free (pub);
-      BN_free (d);
-      goto fail;
-    }
-  if (!EC_KEY_set_public_key (ec, pub))
-    {
-      EC_POINT_free (pub);
-      BN_free (d);
-      goto fail;
-    }
+  EVP_PKEY_CTX_free (ctx);
+  OSSL_PARAM_free (params);
+  OSSL_PARAM_BLD_free (bld);
   EC_POINT_free (pub);
-  BN_free (d);
-
-  EVP_PKEY *pkey = EVP_PKEY_new ();
-  if (!pkey) { EC_KEY_free (ec); goto fail; }
-  if (EVP_PKEY_assign_EC_KEY (pkey, ec) != 1)
-    {
-      EVP_PKEY_free (pkey);
-      EC_KEY_free (ec);
-      goto fail;
-    }
-  /* pkey now owns ec */
+  BN_clear_free (d);
+  EC_GROUP_free (group);
   return pkey;
-
-fail:
-  if (ec) EC_KEY_free (ec);
-  g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                       "failed to build EC_KEY from scalar");
-  return NULL;
 }
 
 /* Sign `data` with `pkey` using ECDSA-SHA256, return DER-encoded sig.
@@ -436,10 +428,7 @@ validity_pairing_run_pretls_fresh_pair_ceremony (FpDevice *dev, GError **error)
       goto out;
     }
   /* layout: status(2) + length LE u32(4) + cert body(184) */
-  guint32 cert_len = (guint32) resp[2]
-                   | ((guint32) resp[3] << 8)
-                   | ((guint32) resp[4] << 16)
-                   | ((guint32) resp[5] << 24);
+  guint32 cert_len = validity_le32 (resp + 2);
   if (cert_len != 184)
     fp_warn ("unexpected cert length in 0x4f response: %u (continuing anyway)",
              cert_len);

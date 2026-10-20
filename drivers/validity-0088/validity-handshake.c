@@ -55,27 +55,13 @@
 /* These trace helpers dump private scalars and session keys, so keep them
  * behind an explicit build flag and off in normal debug builds. */
 static void
-debug_hex (const char   *label,
-           const guint8 *data,
-           gsize         len)
-{
-  GString *hex = g_string_sized_new (len * 2);
-
-  for (gsize i = 0; i < len; i++)
-    g_string_append_printf (hex, "%02x", data[i]);
-
-  fp_dbg ("%s len=%zu hex=%s", label, len, hex->str);
-  g_string_free (hex, TRUE);
-}
-
-static void
 debug_handshake_hash (ValiditySession *session,
                       const char      *label)
 {
   guint8 hash[32];
 
   validity_handshake_hash_finish (session, hash);
-  debug_hex (label, hash, sizeof (hash));
+  validity_debug_hex (label, hash, sizeof (hash));
 }
 
 static void
@@ -86,14 +72,12 @@ debug_handshake_hash_update (ValiditySession *session,
 {
   char hash_label[96];
 
-  debug_hex (label, data, len);
+  validity_debug_hex (label, data, len);
   validity_handshake_hash_update (session, data, len);
   g_snprintf (hash_label, sizeof (hash_label), "%s -> transcript_sha256", label);
   debug_handshake_hash (session, hash_label);
 }
 #else
-#define debug_hex(label, data, len) \
-  G_STMT_START { } G_STMT_END
 #define debug_handshake_hash_update(session, label, data, len) \
   validity_handshake_hash_update ((session), (data), (len))
 #endif
@@ -147,7 +131,7 @@ parse_server_hello (const guint8 *body, gsize body_len,
                    "ServerHello body too short: %zu B", body_len);
       return FALSE;
     }
-  guint16 version = (body[0] << 8) | body[1];
+  guint16 version = validity_be16 (body);
   if (version != VALIDITY_TLS_VERSION)
     {
       g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
@@ -163,7 +147,7 @@ parse_server_hello (const guint8 *body, gsize body_len,
                            "ServerHello truncated at cipher_suite/compression");
       return FALSE;
     }
-  *cipher_suite_out = (body[off] << 8) | body[off + 1];
+  *cipher_suite_out = validity_be16 (body + off);
   if (body[off + 2] != 0)
     {
       g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
@@ -203,8 +187,8 @@ synaptics_tlv_find (const guint8 *body, gsize body_len,
   gsize off = 0;
   while (off + SYNAPTICS_TLV_HEADER_LEN <= body_len)
     {
-      guint16 tag = (guint16) body[off] | ((guint16) body[off + 1] << 8);
-      guint16 len = (guint16) body[off + 2] | ((guint16) body[off + 3] << 8);
+      guint16 tag = validity_le16 (body + off);
+      guint16 len = validity_le16 (body + off + 2);
       if (tag == SYNAPTICS_TLV_END_TAG)
         return FALSE;
       gsize record_end = off + SYNAPTICS_TLV_HEADER_LEN + len;
@@ -388,7 +372,7 @@ iterate_handshake_messages (const guint8 *data, gsize data_len,
           return FALSE;
         }
       guint8 t = data[off];
-      gsize len = (data[off + 1] << 16) | (data[off + 2] << 8) | data[off + 3];
+      gsize len = validity_be24 (data + off + 1);
       if (off + HS_HEADER_LEN + len > data_len)
         {
           g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
@@ -519,18 +503,9 @@ load_rsa_key_from_virp_blob (const guint8 *blob,
     fp_dbg ("tag-4 RSA blob len=%zu; importing first %u bytes",
             blob_len, CAPI_RSA_PRIVATE_BLOB_LEN);
 
-  guint32 alg_id = (guint32) blob[4]
-                  | ((guint32) blob[5] << 8)
-                  | ((guint32) blob[6] << 16)
-                  | ((guint32) blob[7] << 24);
-  guint32 magic = (guint32) blob[8]
-                 | ((guint32) blob[9] << 8)
-                 | ((guint32) blob[10] << 16)
-                 | ((guint32) blob[11] << 24);
-  guint32 bit_len = (guint32) blob[12]
-                   | ((guint32) blob[13] << 8)
-                   | ((guint32) blob[14] << 16)
-                   | ((guint32) blob[15] << 24);
+  guint32 alg_id = validity_le32 (blob + 4);
+  guint32 magic = validity_le32 (blob + 8);
+  guint32 bit_len = validity_le32 (blob + 12);
 
   if (blob[0] != CAPI_PRIVATEKEYBLOB
       || blob[1] != CAPI_CUR_BLOB_VERSION
@@ -780,7 +755,7 @@ ecdsa_sign_handshake_hash (EVP_PKEY     *priv_key,
                            gsize        *out_sig_len,
                            GError      **error)
 {
-  debug_hex ("ECDSA_SIGN input transcript_sha256", hs_hash, 32);
+  validity_debug_hex ("ECDSA_SIGN input transcript_sha256", hs_hash, 32);
 
   /* Use the "prehashed" path: feed in the 32-byte SHA-256 directly. */
   EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new (priv_key, NULL);
@@ -818,7 +793,7 @@ ecdsa_sign_handshake_hash (EVP_PKEY     *priv_key,
     }
   EVP_PKEY_CTX_free (ctx);
   *out_sig_len = sig_len;
-  debug_hex ("ECDSA_SIGN output der", sig, sig_len);
+  validity_debug_hex ("ECDSA_SIGN output der", sig, sig_len);
   return sig;
 }
 
@@ -964,8 +939,8 @@ build_client_second_message (FpDevice         *dev,
     }
   else
     {
-      debug_hex ("CertificateVerify signing host_private_scalar",
-                 validity_cached_host_private_key, VALIDITY_ECC_COORD_LEN);
+      validity_debug_hex ("CertificateVerify signing host_private_scalar",
+                          validity_cached_host_private_key, VALIDITY_ECC_COORD_LEN);
       cv_sig = ecdsa_sign_handshake_hash (host_keypair, hs_hash,
                                           &cv_sig_len, error);
     }
@@ -1002,7 +977,7 @@ build_client_second_message (FpDevice         *dev,
   /* Compute verify_data over the current handshake hash. */
   guint8 hs_hash_fin[32];
   validity_handshake_hash_finish (session, hs_hash_fin);
-  debug_hex ("Finished input transcript_sha256", hs_hash_fin, 32);
+  validity_debug_hex ("Finished input transcript_sha256", hs_hash_fin, 32);
   guint8 verify_data[VALIDITY_VERIFY_DATA_LEN];
   if (!validity_tls12_prf (session->master_secret, VALIDITY_MASTER_SECRET_LEN,
                            (const guint8 *) "client finished", 15,
@@ -1026,11 +1001,11 @@ build_client_second_message (FpDevice         *dev,
   finished_plaintext[3] = VALIDITY_VERIFY_DATA_LEN;
   memcpy (finished_plaintext + HS_HEADER_LEN, verify_data,
           VALIDITY_VERIFY_DATA_LEN);
-  debug_hex ("Finished client verify_data", verify_data,
-             VALIDITY_VERIFY_DATA_LEN);
-  debug_hex ("CCS plaintext record", ccs_record, sizeof (ccs_record));
-  debug_hex ("Finished plaintext before encryption",
-             finished_plaintext, sizeof (finished_plaintext));
+  validity_debug_hex ("Finished client verify_data", verify_data,
+                      VALIDITY_VERIFY_DATA_LEN);
+  validity_debug_hex ("CCS plaintext record", ccs_record, sizeof (ccs_record));
+  validity_debug_hex ("Finished plaintext before encryption",
+                      finished_plaintext, sizeof (finished_plaintext));
 
   /* SYNAPTICS DEVIATION: the server's
    * verify_data is computed over the handshake transcript EXCLUDING
@@ -1067,7 +1042,7 @@ build_client_second_message (FpDevice         *dev,
   memcpy (out + p, ccs_record, sizeof (ccs_record)); p += sizeof (ccs_record);
   memcpy (out + p, finished_record, finished_ct_len); p += finished_ct_len;
   g_assert_cmpuint (p, ==, total);
-  debug_hex ("OUT second_blob complete", out, total);
+  validity_debug_hex ("OUT second_blob complete", out, total);
   *out_len = total;
   return out;
 }
@@ -1117,7 +1092,7 @@ validity_run_tls_handshake (FpDevice *dev, ValiditySession *session,
   /* ClientHello layout: [4-B prefix][5-B record header][handshake msg...] */
   const guint8 *ch_msg = ch_with_prefix + 4 + RECORD_HEADER_LEN;
   gsize ch_msg_len = ch_with_prefix_len - 4 - RECORD_HEADER_LEN;
-  debug_hex ("OUT ClientHello complete", ch_with_prefix, ch_with_prefix_len);
+  validity_debug_hex ("OUT ClientHello complete", ch_with_prefix, ch_with_prefix_len);
   debug_handshake_hash_update (session, "HASH_UPDATE client ClientHello",
                                ch_msg, ch_msg_len);
 
@@ -1139,14 +1114,14 @@ validity_run_tls_handshake (FpDevice *dev, ValiditySession *session,
   /* DEBUG: dump device's first-blob response so we can spot Certificate
    * (handshake type 0x0b) if device is in fresh-pair state. */
   {
-    debug_hex ("IN rsp1 complete", rsp1, rsp1_len);
+    validity_debug_hex ("IN rsp1 complete", rsp1, rsp1_len);
     /* Quick walk: enumerate handshake message types in the record */
     if (rsp1_len >= 9 && rsp1[0] == VALIDITY_CT_HANDSHAKE) {
-      gsize rec = (rsp1[3] << 8) | rsp1[4];
+      gsize rec = validity_be16 (rsp1 + 3);
       gsize p = 5;
       while (p + 4 <= 5 + rec && p + 4 <= rsp1_len) {
         guint8 ht = rsp1[p];
-        gsize ml = (rsp1[p+1] << 16) | (rsp1[p+2] << 8) | rsp1[p+3];
+        gsize ml = validity_be24 (rsp1 + p + 1);
         fp_dbg ("  HS msg type=0x%02x len=%zu", ht, ml);
         p += 4 + ml;
       }
@@ -1159,7 +1134,7 @@ validity_run_tls_handshake (FpDevice *dev, ValiditySession *session,
                    rsp1_len ? rsp1[0] : 0, rsp1_len);
       return FALSE;
     }
-  gsize rec_len = (rsp1[3] << 8) | rsp1[4];
+  gsize rec_len = validity_be16 (rsp1 + 3);
   if (RECORD_HEADER_LEN + rec_len > rsp1_len)
     {
       g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
@@ -1229,17 +1204,17 @@ validity_run_tls_handshake (FpDevice *dev, ValiditySession *session,
   fp_dbg ("  EPH: %02x%02x%02x%02x... (our X)",
           session->ephemeral_pub_x[0], session->ephemeral_pub_x[1],
           session->ephemeral_pub_x[2], session->ephemeral_pub_x[3]);
-  debug_hex ("  cached device ECDH pub X",
-             validity_cached_device_ecdh_pubkey_x, VALIDITY_ECC_COORD_LEN);
-  debug_hex ("  cached device ECDH pub Y",
-             validity_cached_device_ecdh_pubkey_y, VALIDITY_ECC_COORD_LEN);
-  debug_hex ("  ephemeral private scalar", session->ephemeral_priv,
-             VALIDITY_ECC_COORD_LEN);
-  debug_hex ("  ephemeral public X", session->ephemeral_pub_x,
-             VALIDITY_ECC_COORD_LEN);
-  debug_hex ("  ephemeral public Y", session->ephemeral_pub_y,
-             VALIDITY_ECC_COORD_LEN);
-  debug_hex ("  PMS", pms, pms_len);
+  validity_debug_hex ("  cached device ECDH pub X",
+                      validity_cached_device_ecdh_pubkey_x, VALIDITY_ECC_COORD_LEN);
+  validity_debug_hex ("  cached device ECDH pub Y",
+                      validity_cached_device_ecdh_pubkey_y, VALIDITY_ECC_COORD_LEN);
+  validity_debug_hex ("  ephemeral private scalar", session->ephemeral_priv,
+                      VALIDITY_ECC_COORD_LEN);
+  validity_debug_hex ("  ephemeral public X", session->ephemeral_pub_x,
+                      VALIDITY_ECC_COORD_LEN);
+  validity_debug_hex ("  ephemeral public Y", session->ephemeral_pub_y,
+                      VALIDITY_ECC_COORD_LEN);
+  validity_debug_hex ("  PMS", pms, pms_len);
 #endif
 
   /* 5. Derive master_secret + key_block + 4 session keys. */
@@ -1279,7 +1254,7 @@ validity_run_tls_handshake (FpDevice *dev, ValiditySession *session,
                                    rsp2, VALIDITY_MAX_RECV_LEN, &rsp2_len,
                                    VALIDITY_USB_RECV_TIMEOUT, NULL, error))
     return FALSE;
-  debug_hex ("IN rsp2 complete", rsp2, rsp2_len);
+  validity_debug_hex ("IN rsp2 complete", rsp2, rsp2_len);
   /* If the first record is a TLS Alert, parse it. WARNING-level
    * alerts (level=1) per RFC 5246 do NOT terminate the connection;
    * we log and try to keep reading for the expected CCS+Finished. */
@@ -1355,7 +1330,7 @@ validity_run_tls_handshake (FpDevice *dev, ValiditySession *session,
                    "got type 0x%02x", fin_rec[0]);
       return FALSE;
     }
-  gsize fin_body_len = (fin_rec[3] << 8) | fin_rec[4];
+  gsize fin_body_len = validity_be16 (fin_rec + 3);
   if (fin_rec_offset + RECORD_HEADER_LEN + fin_body_len > rsp2_len)
     {
       g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,

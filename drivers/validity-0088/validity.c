@@ -17,6 +17,7 @@
 
 #include "drivers_api.h"
 #include "validity.h"
+#include "validity-match.h"
 
 /* ===========================================================================
  * Driver class
@@ -32,12 +33,16 @@ struct _FpiDeviceValidity0088
 
   /* Per-task state for the async enroll/verify SSMs. Reset at the
    * start of each task; freed by the SSM done callback. */
-  FpImage           *captured_image;
   FpPrint           *stage_print;
+  guint8             captured_tpl[VALIDITY_IMAGE_DATA_LEN];
+  GPtrArray         *enroll_templates;   /* GBytes, one per accepted tap */
+  gdouble            verify_score;
   FpiMatchResult     verify_result;
+  FpPrint           *identify_match;     /* borrowed from the identify gallery */
   gint               enroll_completed;
   gint               enroll_attempts;
   gboolean           enroll_needs_scan_setup;
+  ValidityCalibration *cal_work;         /* non-NULL while calibrating */
 };
 
 G_DEFINE_TYPE (FpiDeviceValidity0088, fpi_device_validity_0088, FP_TYPE_DEVICE);
@@ -48,6 +53,12 @@ validity_device_get_session (FpDevice *dev)
   return &FPI_DEVICE_VALIDITY_0088 (dev)->session;
 }
 
+GCancellable *
+validity_device_get_interrupt_cancellable (FpDevice *dev)
+{
+  return FPI_DEVICE_VALIDITY_0088 (dev)->interrupt_cancellable;
+}
+
 static const FpIdEntry validity_id_table[] = {
   { .vid = 0x06CB, .pid = 0x0088, .driver_data = 0 },  /* Kensington VeriMark */
   /* Siblings (uncomment when validated):
@@ -56,238 +67,6 @@ static const FpIdEntry validity_id_table[] = {
    */
   { .vid = 0, .pid = 0, .driver_data = 0 }
 };
-
-/* ===========================================================================
- * USB transport helpers
- *
- * libfprint provides FpiUsbTransfer (built on gusb / libusb). We use
- * bulk OUT on endpoint 0x01 and bulk IN on endpoint 0x81 for the
- * command channel. EP 0x83 is the interrupt-event channel.
- *
- * For brevity, the helpers below are synchronous wrappers. A real
- * production driver should use the async FpiSsm-based pattern to
- * avoid blocking the main loop. See egismoc / goodixmoc for examples.
- * ========================================================================= */
-
-gboolean
-validity_usb_write (FpDevice    *dev,
-                    const guint8 *data,
-                    gsize         len,
-                    GError      **error)
-{
-  GUsbDevice *udev = fpi_device_get_usb_device (dev);
-  gsize transferred = 0;
-
-  if (g_usb_device_get_vid (udev) != 0x06cb ||
-      g_usb_device_get_pid (udev) != 0x0088)
-    {
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
-                   "refusing to write to unexpected USB device %04x:%04x",
-                   g_usb_device_get_vid (udev),
-                   g_usb_device_get_pid (udev));
-      return FALSE;
-    }
-
-  return g_usb_device_bulk_transfer (
-      udev, VALIDITY_EP_CMD_OUT,
-      (guint8 *) data, len, &transferred,
-      VALIDITY_USB_SEND_TIMEOUT,
-      fpi_device_get_cancellable (dev), error);
-}
-
-gboolean
-validity_usb_read (FpDevice  *dev,
-                   guint8    *buf,
-                   gsize      max_len,
-                   gsize     *out_len,
-                   GError   **error)
-{
-  GUsbDevice *udev = fpi_device_get_usb_device (dev);
-  return g_usb_device_bulk_transfer (
-      udev, VALIDITY_EP_CMD_IN,
-      buf, max_len, out_len,
-      VALIDITY_USB_RECV_TIMEOUT,
-      fpi_device_get_cancellable (dev), error);
-}
-
-static gchar *
-validity_hex_prefix (const guint8 *data,
-                     gsize         len,
-                     gsize         max_len)
-{
-  GString *hex = g_string_sized_new (MIN (len, max_len) * 2 + 4);
-
-  for (gsize i = 0; i < MIN (len, max_len); i++)
-    g_string_append_printf (hex, "%02x", data[i]);
-  if (len > max_len)
-    g_string_append (hex, "...");
-
-  return g_string_free (hex, FALSE);
-}
-
-static gboolean
-validity_read_app_plaintext (FpDevice  *dev,
-                             guint8   **out_plain,
-                             gsize     *out_len,
-                             GError   **error)
-{
-  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (dev);
-  guint8 rsp[VALIDITY_MAX_RECV_LEN];
-  gsize rsp_len = 0;
-
-  if (!validity_usb_read (dev, rsp, sizeof (rsp), &rsp_len, error))
-    return FALSE;
-
-  if (rsp_len < 5 ||
-      rsp[0] != VALIDITY_CT_APPLICATION_DATA ||
-      rsp[1] != 0x03 || rsp[2] != 0x03)
-    {
-      g_autofree gchar *hex = validity_hex_prefix (rsp, rsp_len, 32);
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                   "expected TLS app_data record, got %zu B: %s",
-                   rsp_len, hex);
-      return FALSE;
-    }
-
-  guint16 body_len = ((guint16) rsp[3] << 8) | rsp[4];
-  if ((gsize) body_len + 5 > rsp_len)
-    {
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                   "truncated TLS app_data record: body=%u usb=%zu",
-                   body_len, rsp_len);
-      return FALSE;
-    }
-
-  *out_plain = validity_decrypt_record (&self->session,
-                                        VALIDITY_CT_APPLICATION_DATA,
-                                        rsp + 5, body_len, out_len);
-  if (*out_plain == NULL)
-    {
-      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                           "failed to decrypt TLS app_data response");
-      return FALSE;
-    }
-
-  return TRUE;
-}
-
-gboolean
-validity_exchange_app_plaintext (FpDevice     *dev,
-                                 const guint8 *plain,
-                                 gsize         plain_len,
-                                 guint8      **out_rsp,
-                                 gsize        *out_rsp_len,
-                                 GError      **error)
-{
-  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (dev);
-  g_autofree guint8 *record = NULL;
-  gsize record_len = 0;
-
-  if (!self->session.cipher_active)
-    {
-      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_CONNECTED,
-                           "TLS app_data requested before cipher activation");
-      return FALSE;
-    }
-
-  record = validity_encrypt_record (&self->session,
-                                    VALIDITY_CT_APPLICATION_DATA,
-                                    plain, plain_len, &record_len);
-  if (record == NULL)
-    {
-      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                           "validity_encrypt_record(app_data) failed");
-      return FALSE;
-    }
-
-  if (!validity_usb_write (dev, record, record_len, error))
-    return FALSE;
-
-  return validity_read_app_plaintext (dev, out_rsp, out_rsp_len, error);
-}
-
-/* Status word interpretation.
- *
- * Every encrypted device response begins with a 2-byte status word.
- * Observed live across hundreds of successful exchanges:
- *   0x00 0x00 = OK / success
- *
- * Other status codes have not been observed live yet — the device tends to
- * either ACK with 0x00 0x00 or stall the channel entirely. When new non-zero
- * codes are observed in the wild, extend this switch with their semantic
- * mapping (e.g. probe-in-progress, retry, hardware error).
- *
- * Until then, treat any non-zero status as FP_DEVICE_ERROR_PROTO (protocol
- * violation) so libfprint surfaces a more specific error to callers than
- * the previous generic G_IO_ERROR_FAILED.
- */
-static gboolean
-validity_validate_status (const gchar  *label,
-                          const guint8 *rsp,
-                          gsize         rsp_len,
-                          GError      **error)
-{
-  if (rsp_len < 2)
-    {
-      g_propagate_error (
-          error,
-          fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
-                                    "%s response too short: %zu B",
-                                    label, rsp_len));
-      return FALSE;
-    }
-
-  guint16 status = ((guint16) rsp[0] << 8) | rsp[1];
-  if (status == 0x0000)
-    return TRUE;
-
-  /* Map known status codes to specific libfprint errors as we learn them.
-   * The current driver has not observed any non-zero status code in the
-   * wild yet, so this is forward-looking scaffolding.
-   */
-  FpDeviceError code = FP_DEVICE_ERROR_PROTO;
-  const gchar *meaning = "unknown status";
-  switch (status)
-    {
-    /* Placeholder examples — populate from real captures when observed.
-     *
-     * case 0x0001: code = FP_DEVICE_ERROR_GENERAL; meaning = "device busy"; break;
-     * case 0x0002: code = FP_DEVICE_ERROR_NOT_SUPPORTED; meaning = "command not supported"; break;
-     */
-    default:
-      break;
-    }
-
-  fp_warn ("%s: unexpected device status 0x%04x (%s) — please report",
-           label, status, meaning);
-  g_propagate_error (
-      error,
-      fpi_device_error_new_msg (code,
-                                "%s: device returned status 0x%04x (%s)",
-                                label, status, meaning));
-  return FALSE;
-}
-
-static gboolean
-validity_exchange_and_check_status (FpDevice     *dev,
-                                    const gchar  *label,
-                                    const guint8 *plain,
-                                    gsize         plain_len,
-                                    GError      **error)
-{
-  g_autofree guint8 *rsp = NULL;
-  gsize rsp_len = 0;
-
-  fp_dbg ("%s: send %zu B plaintext opcode 0x%02x",
-          label, plain_len, plain_len > 0 ? plain[0] : 0xff);
-  if (!validity_exchange_app_plaintext (dev, plain, plain_len,
-                                        &rsp, &rsp_len, error))
-    return FALSE;
-
-  fp_dbg ("%s: got %zu B plaintext response", label, rsp_len);
-  return validity_validate_status (label, rsp, rsp_len, error);
-}
-
 
 /* ---------------------------------------------------------------------------
  * LED helpers
@@ -445,14 +224,8 @@ validity_send_host_part_read (FpDevice  *dev,
   cmd[0] = 0x40;
   cmd[1] = tag1;
   cmd[2] = tag2;
-  cmd[5] =  val1        & 0xff;
-  cmd[6] = (val1 >> 8)  & 0xff;
-  cmd[7] = (val1 >> 16) & 0xff;
-  cmd[8] = (val1 >> 24) & 0xff;
-  cmd[9] =  val2        & 0xff;
-  cmd[10] = (val2 >> 8)  & 0xff;
-  cmd[11] = (val2 >> 16) & 0xff;
-  cmd[12] = (val2 >> 24) & 0xff;
+  validity_put_le32 (cmd + 5, val1);
+  validity_put_le32 (cmd + 9, val2);
 
   return validity_exchange_app_plaintext (dev, cmd, 13,
                                           out_data, out_data_len,
@@ -488,8 +261,8 @@ validity_find_tlv (const guint8 *data,
   gsize off = 0;
   while (off + 4 <= data_len)
     {
-      guint16 tag    = ((guint16) data[off] | ((guint16) data[off + 1] << 8));
-      guint16 length = ((guint16) data[off + 2] | ((guint16) data[off + 3] << 8));
+      guint16 tag    = validity_le16 (data + off);
+      guint16 length = validity_le16 (data + off + 2);
 
       if (off + 4 + (gsize) length > data_len)
         return FALSE;
@@ -527,7 +300,7 @@ validity_send_cert_acquisition (FpDevice  *dev,
 {
   /* Virgin-path 0x4f payload is a 5-byte zero-padded buffer
    * `4f 00 00 00 00`, not a bare 1-byte opcode. A 1-byte send
-   * returns 0x0104 because the device's command framer expects
+   * returns 0x0401 because the device's command framer expects
    * the full 5-byte form. */
   guint8 request[5] = { 0x4f, 0x00, 0x00, 0x00, 0x00 };
   g_autofree guint8 *response = NULL;
@@ -549,7 +322,7 @@ validity_send_cert_acquisition (FpDevice  *dev,
       return FALSE;
     }
 
-  guint16 status = ((guint16) response[0] << 8) | response[1];
+  guint16 status = validity_le16 (response);
   if (out_status != NULL)
     *out_status = status;
   if (status != 0x0000)
@@ -581,129 +354,6 @@ validity_send_cert_acquisition (FpDevice  *dev,
   memcpy (out_cert_blob, val, 0xb8);
   fp_dbg ("0x4f cert acquisition OK: 0xb8-byte blob received");
   return TRUE;
-}
-
-static gint
-validity_get_bz3_threshold (void)
-{
-  const gchar *env = g_getenv ("VALIDITY0088_BZ3_THRESHOLD");
-  gchar *end = NULL;
-  gint64 value;
-
-  if (env == NULL || env[0] == '\0')
-    return 40;
-
-  value = g_ascii_strtoll (env, &end, 10);
-  if (end == env || *end != '\0' || value <= 0 || value > G_MAXINT)
-    {
-      fp_warn ("ignoring invalid VALIDITY0088_BZ3_THRESHOLD=%s", env);
-      return 40;
-    }
-
-  return (gint) value;
-}
-
-static guint
-validity_get_image_scale (void)
-{
-  const gchar *env = g_getenv ("VALIDITY0088_IMAGE_SCALE");
-  gchar *end = NULL;
-  guint64 value;
-
-  if (env == NULL || env[0] == '\0')
-    return 2;
-
-  value = g_ascii_strtoull (env, &end, 10);
-  if (end == env || *end != '\0' || value == 0 || value > 4)
-    {
-      fp_warn ("ignoring invalid VALIDITY0088_IMAGE_SCALE=%s", env);
-      return 2;
-    }
-
-  return (guint) value;
-}
-
-static FpiImageFlags
-validity_get_image_flags (void)
-{
-  FpiImageFlags flags = FPI_IMAGE_NONE;
-  const gchar *env;
-
-  env = g_getenv ("VALIDITY0088_IMAGE_PARTIAL");
-  if (env != NULL && env[0] != '\0' && g_strcmp0 (env, "0") != 0)
-    flags |= FPI_IMAGE_PARTIAL;
-
-  env = g_getenv ("VALIDITY0088_IMAGE_INVERT");
-  if (env != NULL && env[0] != '\0' && g_strcmp0 (env, "0") != 0)
-    flags |= FPI_IMAGE_COLORS_INVERTED;
-
-  env = g_getenv ("VALIDITY0088_IMAGE_H_FLIP");
-  if (env != NULL && env[0] != '\0' && g_strcmp0 (env, "0") != 0)
-    flags |= FPI_IMAGE_H_FLIPPED;
-
-  env = g_getenv ("VALIDITY0088_IMAGE_V_FLIP");
-  if (env != NULL && env[0] != '\0' && g_strcmp0 (env, "0") != 0)
-    flags |= FPI_IMAGE_V_FLIPPED;
-
-  return flags;
-}
-
-static FpImage *
-validity_scale_image_nearest (FpImage *src,
-                              guint    scale)
-{
-  FpImage *dst;
-
-  if (scale <= 1)
-    return g_object_ref (src);
-
-  dst = fp_image_new (src->width * scale, src->height * scale);
-  dst->flags = src->flags;
-
-  for (guint y = 0; y < dst->height; y++)
-    {
-      guint src_y = y / scale;
-
-      for (guint x = 0; x < dst->width; x++)
-        {
-          guint src_x = x / scale;
-
-          dst->data[y * dst->width + x] =
-              src->data[src_y * src->width + src_x];
-        }
-    }
-
-  return dst;
-}
-
-static FpImage *
-validity_image_from_plaintext (const guint8 *plain,
-                               gsize         plain_len,
-                               GError      **error)
-{
-  const ValidityImageRecord *record = (const ValidityImageRecord *) plain;
-  g_autoptr(FpImage) raw_image = NULL;
-  FpImage *image;
-  guint scale;
-
-  if (plain_len != VALIDITY_IMAGE_RECORD_LEN ||
-      !validity_image_record_validate (record))
-    {
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                   "not a valid image record: %zu B", plain_len);
-      return NULL;
-    }
-
-  raw_image = fp_image_new (VALIDITY_IMAGE_WIDTH, VALIDITY_IMAGE_HEIGHT);
-  raw_image->flags = validity_get_image_flags ();
-  memcpy (raw_image->data, record->pixels, VALIDITY_IMAGE_DATA_LEN);
-
-  scale = validity_get_image_scale ();
-  image = validity_scale_image_nearest (raw_image, scale);
-  fp_dbg ("image prepared for NBIS: %ux%u scale=%u flags=0x%x",
-          image->width, image->height, scale, image->flags);
-
-  return image;
 }
 
 /* ===========================================================================
@@ -878,24 +528,23 @@ validity_send_plaintext_init (FpDevice *dev,
 
   /* 5. get_fw_info(0x02) - probe the fwext partition. python-validity
    * usb.py:89 sends this between INIT_MSG2 and INIT_MSG4 to decide
-   * whether to follow up with init_hardcoded_clean_slate. On 0088 the
-   * fwext partition is always present (every captured session shows
-   * status=0), so this probe is purely diagnostic: if it ever reports
-   * non-zero, the next handshake step will fail with bad_certificate
-   * or similar, and this log line tells the user why. */
+   * whether to follow up with init_hardcoded_clean_slate. Purely
+   * diagnostic here: working, paired 0088 units answer 0x04af on every
+   * open (0x4af is in the Windows driver's status table) and everything
+   * after it works, so only other non-zero values are worth a warning. */
   guint8 fw_probe[2] = { VALIDITY_OP_GET_FW_INFO, 0x02 };
   if (validity_send_wire (dev, fw_probe, sizeof (fw_probe),
                           rsp, sizeof (rsp), &rsp_len, NULL))
     {
       if (rsp_len >= 2)
         {
-          guint16 fw_status = (guint16) rsp[0] | ((guint16) rsp[1] << 8);
-          if (fw_status != 0)
-            fp_warn ("validity-0088: get_fw_info(fwext) returned 0x%04x; "
-                     "fwext partition appears not loaded - subsequent "
-                     "init steps will likely fail. This 0088 driver does "
-                     "not ship a clean-slate INIT_MSG4 variant.",
-                     fw_status);
+          guint16 fw_status = validity_le16 (rsp);
+          if (fw_status == 0 || fw_status == VALIDITY_STATUS_FWEXT_NOT_LOADED)
+            fp_dbg ("get_fw_info(fwext) status 0x%04x", fw_status);
+          else
+            fp_warn ("validity-0088: get_fw_info(fwext) returned unexpected "
+                     "status 0x%04x; if pairing or the TLS handshake fails "
+                     "next, this is the likely cause", fw_status);
         }
     }
   /* Probe failure is non-fatal: the driver works without it on
@@ -949,229 +598,6 @@ validity_tls_handshake (FpDevice *dev, GError **error)
  * usable stages are collected.
  * ========================================================================= */
 
-typedef void (*ValidityAsyncRecvCb) (FpDevice     *device,
-                                     FpiSsm       *ssm,
-                                     const guint8 *plain,
-                                     gsize         plain_len,
-                                     gpointer      user_data);
-
-typedef struct {
-  FpiSsm              *ssm;
-  ValidityAsyncRecvCb  cb;
-  gpointer             cb_data;
-  const gchar         *label;
-  gboolean             check_status;
-} ValidityExchangeCtx;
-
-static void
-validity_async_recv_cb (FpiUsbTransfer *transfer,
-                        FpDevice       *device,
-                        gpointer        userdata,
-                        GError         *error)
-{
-  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
-  g_autofree ValidityExchangeCtx *ctx = userdata;
-  g_autofree guint8 *plain = NULL;
-  gsize plain_len = 0;
-  const guint8 *rsp;
-  gsize rsp_len;
-  guint16 body_len;
-
-  if (error)
-    {
-      fpi_ssm_mark_failed (ctx->ssm, error);
-      return;
-    }
-
-  rsp = transfer->buffer;
-  rsp_len = transfer->actual_length;
-
-  if (rsp_len < 5 ||
-      rsp[0] != VALIDITY_CT_APPLICATION_DATA ||
-      rsp[1] != 0x03 || rsp[2] != 0x03)
-    {
-      g_autofree gchar *hex = validity_hex_prefix (rsp, rsp_len, 32);
-      fpi_ssm_mark_failed (ctx->ssm,
-          g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                       "%s: expected TLS app_data record, got %zu B: %s",
-                       ctx->label, rsp_len, hex));
-      return;
-    }
-
-  body_len = ((guint16) rsp[3] << 8) | rsp[4];
-  if ((gsize) body_len + 5 > rsp_len)
-    {
-      fpi_ssm_mark_failed (ctx->ssm,
-          g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                       "%s: truncated TLS app_data: body=%u usb=%zu",
-                       ctx->label, body_len, rsp_len));
-      return;
-    }
-
-  plain = validity_decrypt_record (&self->session,
-                                   VALIDITY_CT_APPLICATION_DATA,
-                                   rsp + 5, body_len, &plain_len);
-  if (plain == NULL)
-    {
-      fpi_ssm_mark_failed (ctx->ssm,
-          g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                       "%s: failed to decrypt TLS app_data", ctx->label));
-      return;
-    }
-
-  fp_dbg ("%s: got %zu B plaintext response", ctx->label, plain_len);
-
-  if (ctx->check_status)
-    {
-      GError *err = NULL;
-      if (!validity_validate_status (ctx->label, plain, plain_len, &err))
-        {
-          fpi_ssm_mark_failed (ctx->ssm, err);
-          return;
-        }
-    }
-
-  if (ctx->cb != NULL)
-    ctx->cb (device, ctx->ssm, plain, plain_len, ctx->cb_data);
-  else
-    fpi_ssm_next_state (ctx->ssm);
-}
-
-static void
-validity_async_send_cb (FpiUsbTransfer *transfer,
-                        FpDevice       *device,
-                        gpointer        userdata,
-                        GError         *error)
-{
-  ValidityExchangeCtx *ctx = userdata;
-  FpiUsbTransfer *recv;
-
-  if (error)
-    {
-      fpi_ssm_mark_failed (ctx->ssm, error);
-      g_free (ctx);
-      return;
-    }
-
-  recv = fpi_usb_transfer_new (device);
-  fpi_usb_transfer_fill_bulk (recv, VALIDITY_EP_CMD_IN, VALIDITY_MAX_RECV_LEN);
-  fpi_usb_transfer_submit (recv, VALIDITY_USB_RECV_TIMEOUT,
-                           fpi_device_get_cancellable (device),
-                           validity_async_recv_cb, ctx);
-}
-
-/* Submit one encrypted round-trip: encrypt plain, USB OUT, USB IN, decrypt.
- * If cb is NULL: on success, advance ssm to next state (after the optional
- * 2-byte status word check); on error, mark ssm failed.
- * If cb is non-NULL: invoke cb with the decrypted plaintext; cb owns the
- * SSM state transition. */
-static void
-validity_ssm_exchange (FpiSsm              *ssm,
-                       FpDevice            *device,
-                       const gchar         *label,
-                       const guint8        *plain,
-                       gsize                plain_len,
-                       gboolean             check_status,
-                       ValidityAsyncRecvCb  cb,
-                       gpointer             cb_data)
-{
-  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
-  ValidityExchangeCtx *ctx;
-  FpiUsbTransfer *send;
-  guint8 *record;
-  gsize record_len = 0;
-
-  if (!self->session.cipher_active)
-    {
-      fpi_ssm_mark_failed (ssm,
-          g_error_new_literal (G_IO_ERROR, G_IO_ERROR_NOT_CONNECTED,
-                               "TLS app_data requested before cipher activation"));
-      return;
-    }
-
-  record = validity_encrypt_record (&self->session,
-                                    VALIDITY_CT_APPLICATION_DATA,
-                                    plain, plain_len, &record_len);
-  if (record == NULL)
-    {
-      fpi_ssm_mark_failed (ssm,
-          g_error_new_literal (G_IO_ERROR, G_IO_ERROR_FAILED,
-                               "validity_encrypt_record(app_data) failed"));
-      return;
-    }
-
-  fp_dbg ("%s: send %zu B plaintext opcode 0x%02x",
-          label, plain_len, plain_len > 0 ? plain[0] : 0xff);
-
-  ctx = g_new (ValidityExchangeCtx, 1);
-  ctx->ssm          = ssm;
-  ctx->cb           = cb;
-  ctx->cb_data      = cb_data;
-  ctx->label        = label;
-  ctx->check_status = check_status;
-
-  send = fpi_usb_transfer_new (device);
-  fpi_usb_transfer_fill_bulk_full (send, VALIDITY_EP_CMD_OUT,
-                                   record, record_len, g_free);
-  fpi_usb_transfer_submit (send, VALIDITY_USB_SEND_TIMEOUT,
-                           fpi_device_get_cancellable (device),
-                           validity_async_send_cb, ctx);
-}
-
-static void validity_async_submit_interrupt_read (FpiSsm *ssm, FpDevice *device);
-
-static void
-validity_async_interrupt_cb (FpiUsbTransfer *transfer,
-                             FpDevice       *device,
-                             gpointer        userdata,
-                             GError         *error)
-{
-  FpiSsm *ssm = userdata;
-  const guint8 *event;
-  gsize event_len;
-
-  if (error)
-    {
-      fpi_ssm_mark_failed (ssm, error);
-      return;
-    }
-
-  event = transfer->buffer;
-  event_len = transfer->actual_length;
-  {
-    g_autofree gchar *hex = validity_hex_prefix (event, event_len, event_len);
-    fp_dbg ("interrupt event len=%zu data=%s", event_len, hex);
-  }
-
-  if (event_len >= 1 && event[0] == 0x02)
-    fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
-
-  if (event_len >= 3 && event[0] == 0x03 && (event[2] & 0x04))
-    {
-      fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
-      fpi_ssm_next_state (ssm);
-      return;
-    }
-
-  if (event_len >= 1 && event[0] == 0x00)
-    fpi_device_report_finger_status (device, FP_FINGER_STATUS_NEEDED);
-
-  validity_async_submit_interrupt_read (ssm, device);
-}
-
-static void
-validity_async_submit_interrupt_read (FpiSsm *ssm, FpDevice *device)
-{
-  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
-  FpiUsbTransfer *transfer;
-
-  transfer = fpi_usb_transfer_new (device);
-  fpi_usb_transfer_fill_interrupt (transfer, VALIDITY_EP_INT_IN, 64);
-  fpi_usb_transfer_submit (transfer, VALIDITY_USB_INTERRUPT_TIMEOUT,
-                           self->interrupt_cancellable,
-                           validity_async_interrupt_cb, ssm);
-}
-
 static void
 validity_rom_info_response_cb (FpDevice     *device,
                                FpiSsm       *ssm,
@@ -1212,8 +638,126 @@ typedef enum {
   PREP_S_MSG4_2,
   PREP_S_5B_2,
   PREP_S_HOSTPART,
+  PREP_S_CAL_CHECK,
+  PREP_S_CAL_CONFIG,
+  PREP_S_CAL_PROG1,
+  PREP_S_CAL_RAW1,
+  PREP_S_CAL_PROG2,
+  PREP_S_CAL_RAW2,
+  PREP_S_CAL_SAVE,
   PREP_NUM_STATES,
 } ValiditySessionPrepState;
+
+/* --- Native sensor calibration (runs inside session prep) --------------- */
+
+static void
+validity_cal_config_cb (FpDevice     *device,
+                        FpiSsm       *ssm,
+                        const guint8 *plain,
+                        gsize         plain_len,
+                        gpointer      user_data)
+{
+  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
+  GError *err = NULL;
+
+  (void) user_data;
+  validity_cal_dump ("cal-config.bin", plain, plain_len);
+  if (!validity_cal_parse_config_response (plain, plain_len,
+                                           self->cal_work->trim, &err))
+    {
+      fpi_ssm_mark_failed (ssm, err);
+      return;
+    }
+  {
+    g_autofree gchar *hex = validity_hex_prefix (self->cal_work->trim,
+                                                 VALIDITY_CAL_TRIM_LEN, 16);
+    fp_info ("validity-0088: calibration: factory trim %s...", hex);
+  }
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+validity_cal_raw_cb (FpiUsbTransfer *transfer,
+                     FpDevice       *device,
+                     gpointer        userdata,
+                     GError         *error)
+{
+  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
+  FpiSsm *ssm = userdata;
+  gboolean second = fpi_ssm_get_cur_state (ssm) == PREP_S_CAL_RAW2;
+  guint8 *dst = second ? self->cal_work->baseline : self->cal_work->frame;
+  GError *err = NULL;
+  gdouble mean = 0;
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+
+  validity_cal_dump (second ? "cal-raw-2.bin" : "cal-raw-1.bin",
+                     transfer->buffer, transfer->actual_length);
+  fp_dbg ("calibration: raw stream %d: %zd B", second ? 2 : 1,
+          transfer->actual_length);
+
+  if (!validity_cal_frame_from_raw (transfer->buffer, transfer->actual_length,
+                                    dst, &err))
+    {
+      fpi_ssm_mark_failed (ssm, err);
+      return;
+    }
+  if (!validity_cal_frame_plausible (dst, &mean))
+    {
+      fpi_ssm_mark_failed (ssm,
+          g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                       "calibration frame %d looks wrong (mean %.1f); keep "
+                       "the sensor clean and untouched and retry",
+                       second ? 2 : 1, mean));
+      return;
+    }
+  fp_info ("validity-0088: calibration: frame %d ok (mean %.1f)",
+           second ? 2 : 1, mean);
+  if (second)
+    self->cal_work->have_baseline = TRUE;
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+validity_cal_send_program (FpiSsm *ssm, FpDevice *device, ValidityCalProgram kind)
+{
+  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
+  GError *err = NULL;
+  gsize len = 0;
+  g_autofree guint8 *cmd = validity_cal_build_from_template (self->cal_work,
+                                                             kind, &len, &err);
+
+  if (cmd == NULL)
+    {
+      fpi_ssm_mark_failed (ssm, err);
+      return;
+    }
+  validity_cal_dump (kind == VALIDITY_CAL_PROG_CAL1 ? "cal-prog-1.bin"
+                                                    : "cal-prog-2.bin",
+                     cmd, len);
+  validity_ssm_exchange (ssm, device,
+                         kind == VALIDITY_CAL_PROG_CAL1 ? "calibration-program-1"
+                                                        : "calibration-program-2",
+                         cmd, len, TRUE, NULL, NULL);
+}
+
+static void
+validity_cal_read_raw (FpiSsm *ssm, FpDevice *device)
+{
+  FpiUsbTransfer *transfer = fpi_usb_transfer_new (device);
+
+  /* 337 x 152 B is not a multiple of the packet size, so the device ends
+   * the stream with a short packet and the transfer completes. */
+  fpi_usb_transfer_fill_bulk (transfer, VALIDITY_EP_BULK_IN_ALT,
+                              VALIDITY_CAL_RAW_LEN);
+  fpi_usb_transfer_submit (transfer, VALIDITY_USB_RECV_TIMEOUT,
+                           fpi_device_get_cancellable (device),
+                           validity_cal_raw_cb, ssm);
+}
 
 static void
 validity_session_prep_run_state (FpiSsm   *ssm,
@@ -1302,6 +846,69 @@ validity_session_prep_run_state (FpiSsm   *ssm,
       }
       break;
 
+    case PREP_S_CAL_CHECK:
+      {
+        FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
+        ValidityCalibration cal;
+        gboolean force = g_strcmp0 (g_getenv ("VALIDITY0088_RECALIBRATE"), "1") == 0;
+
+        if (self->cal_work == NULL && !force && validity_cal_load (&cal, NULL))
+          {
+            fpi_ssm_mark_completed (ssm);
+            break;
+          }
+        if (self->cal_work != NULL)
+          {
+            /* Second pass through the prep tail after calibrating. */
+            g_clear_pointer (&self->cal_work, g_free);
+            fpi_ssm_mark_completed (ssm);
+            break;
+          }
+        fp_info ("validity-0088: calibrating the sensor - do not touch it");
+        self->cal_work = g_new0 (ValidityCalibration, 1);
+        fpi_ssm_next_state (ssm);
+      }
+      break;
+
+    case PREP_S_CAL_CONFIG:
+      {
+        guint8 cmd[9] = { VALIDITY_OP_READ_CONFIG, 0x00, 0x0e, 0, 0, 0, 0, 0, 0 };
+        validity_ssm_exchange (ssm, device, "calibration-read-config",
+                               cmd, sizeof (cmd), FALSE,
+                               validity_cal_config_cb, NULL);
+      }
+      break;
+
+    case PREP_S_CAL_PROG1:
+      validity_cal_send_program (ssm, device, VALIDITY_CAL_PROG_CAL1);
+      break;
+
+    case PREP_S_CAL_PROG2:
+      validity_cal_send_program (ssm, device, VALIDITY_CAL_PROG_CAL2);
+      break;
+
+    case PREP_S_CAL_RAW1:
+    case PREP_S_CAL_RAW2:
+      validity_cal_read_raw (ssm, device);
+      break;
+
+    case PREP_S_CAL_SAVE:
+      {
+        FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
+        GError *err = NULL;
+
+        self->cal_work->valid = TRUE;
+        if (!validity_cal_save (self->cal_work, &err))
+          {
+            fpi_ssm_mark_failed (ssm, err);
+            break;
+          }
+        /* Re-run the end of the prep so the capture starts from the same
+         * state as without calibration. */
+        fpi_ssm_jump_to_state (ssm, PREP_S_CLEANUP_2);
+      }
+      break;
+
     case PREP_NUM_STATES:
       g_assert_not_reached ();
     }
@@ -1314,6 +921,7 @@ validity_session_prep_done_cb (FpiSsm   *prep_ssm,
 {
   FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
 
+  g_clear_pointer (&self->cal_work, g_free);
   if (error)
     fpi_ssm_mark_failed (self->task_ssm, error);
   else
@@ -1369,68 +977,18 @@ verify_read_image_cb (FpDevice     *device,
                       gpointer      user_data)
 {
   FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
-  GError *err = NULL;
-  FpImage *image;
+  GError *err = validity_no_image_error (plain, plain_len);
 
-  if (plain_len != VALIDITY_IMAGE_RECORD_LEN)
-    {
-      g_autofree gchar *hex = validity_hex_prefix (plain, plain_len, 32);
-      fpi_ssm_mark_failed (ssm,
-          g_error_new (FP_DEVICE_RETRY, FP_DEVICE_RETRY_TOO_SHORT,
-                       "device did not return an image (%zu B: %s)",
-                       plain_len, hex));
-      return;
-    }
-
-  image = validity_image_from_plaintext (plain, plain_len, &err);
-  if (image == NULL)
+  if (err == NULL)
+    validity_store_template (self->captured_tpl, plain, &err);
+  if (err != NULL)
     {
       fpi_ssm_mark_failed (ssm, err);
       return;
     }
 
-  g_clear_object (&self->captured_image);
-  self->captured_image = image;
   fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
   fpi_ssm_next_state (ssm);
-}
-
-static void
-verify_detect_minutiae_cb (GObject      *source,
-                           GAsyncResult *res,
-                           gpointer      user_data)
-{
-  FpDevice *device = user_data;
-  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
-  g_autoptr(FpPrint) print = NULL;
-  GError *err = NULL;
-
-  if (!fp_image_detect_minutiae_finish (FP_IMAGE (source), res, &err))
-    {
-      fp_dbg ("verify minutiae detection failed: %s",
-              err ? err->message : "unknown");
-      g_clear_error (&err);
-      fpi_ssm_mark_failed (self->task_ssm,
-          fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL,
-                                    "Minutiae detection failed, please retry"));
-      return;
-    }
-
-  fp_dbg ("NBIS minutiae extracted: %u",
-          fp_image_get_minutiae (self->captured_image) ?
-          fp_image_get_minutiae (self->captured_image)->len : 0);
-
-  print = fp_print_new (device);
-  fpi_print_set_type (print, FPI_PRINT_NBIS);
-  if (!fpi_print_add_from_image (print, self->captured_image, &err))
-    {
-      fpi_ssm_mark_failed (self->task_ssm, err);
-      return;
-    }
-
-  g_clear_object (&self->stage_print);
-  self->stage_print = g_steal_pointer (&print);
-  fpi_ssm_next_state (self->task_ssm);
 }
 
 static gboolean
@@ -1444,6 +1002,60 @@ verify_led_done_timeout (gpointer user_data)
   return G_SOURCE_REMOVE;
 }
 
+/* Identify: pick the best-scoring gallery print at or above the threshold.
+ * Prints without usable templates (other drivers, damaged data) are skipped
+ * so one bad print does not block identification against the others. */
+static void
+validity_identify_best (FpiDeviceValidity0088      *self,
+                        FpDevice                   *device,
+                        const ValiditySiftFeatures *probe,
+                        gint                        threshold)
+{
+  GPtrArray *prints = NULL;
+  gint best = -1;     /* highest score of any print, for the log */
+
+  fpi_device_get_identify_data (device, &prints);
+  self->identify_match = NULL;
+
+  for (guint i = 0; prints != NULL && i < prints->len; i++)
+    {
+      FpPrint *print = g_ptr_array_index (prints, i);
+      g_autoptr(GVariant) data = NULL;
+      g_autoptr(GError) err = NULL;
+      gint idx, score;
+
+      g_object_get (print, "fpi-data", &data, NULL);
+      if (data == NULL)
+        {
+          fp_dbg ("identify: print %u has no data, skipped", i);
+          continue;
+        }
+      score = validity_tpl_best_score (probe, data,
+                                       fp_print_get_device_id (print),
+                                       &idx, &err);
+      if (score < 0)
+        {
+          fp_dbg ("identify: print %u skipped: %s", i, err->message);
+          continue;
+        }
+      fp_dbg ("identify: print %u scores %d (template %d)", i, score, idx);
+      if (score > best)
+        {
+          best = score;
+          self->identify_match = score >= threshold ? print : NULL;
+        }
+    }
+
+  self->verify_score = best;
+  self->verify_result = self->identify_match != NULL ?
+                        FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
+  fp_dbg ("identify result: %s (best %d consistent keypoints over %u prints, threshold %d)",
+          self->identify_match != NULL ? "MATCH" : "NO_MATCH",
+          best, prints != NULL ? prints->len : 0, threshold);
+}
+
+/* Shared by verify and identify; only the match step and the report
+ * differ (see fpi_device_get_current_action). */
 static void
 validity_verify_run_state (FpiSsm   *ssm,
                            FpDevice *device)
@@ -1460,11 +1072,18 @@ validity_verify_run_state (FpiSsm   *ssm,
       {
         GError *err = NULL;
         gsize cmd_len;
+        /* VALIDITY0088_VERIFY_MODE=enroll selects capture mode 0x23 (used by
+         * enrollment taps 2..10) instead of 0x02; default is unchanged. */
+        guint8 vmode = (g_strcmp0 (g_getenv ("VALIDITY0088_VERIFY_MODE"),
+                                   "enroll") == 0) ?
+                       VALIDITY_CAPTURE_MODE_ENROLL :
+                       VALIDITY_CAPTURE_MODE_IDENTIFY;
         g_autofree guint8 *cmd =
             validity_build_enroll_capture_command (
-                device, VALIDITY_CAPTURE_MODE_IDENTIFY, &cmd_len, &err);
+                device, vmode, &cmd_len, &err);
         if (cmd == NULL) { fpi_ssm_mark_failed (ssm, err); return; }
-        fp_dbg ("verify: send capture program; tap finger when prompted");
+        fp_dbg ("verify: send capture program (mode 0x%02x); tap finger when prompted",
+                vmode);
         validity_ssm_exchange (ssm, device, "verify-capture",
                                cmd, cmd_len, TRUE,
                                validity_capture_response_cb, NULL);
@@ -1481,35 +1100,81 @@ validity_verify_run_state (FpiSsm   *ssm,
         gsize cmd_len;
         g_autofree guint8 *cmd =
             validity_build_enroll_read_image_command (0x2000, &cmd_len);
+        /* check_status=FALSE: a bad scan answers 0x51 with non-zero status
+         * (0x0007); verify_read_image_cb() turns that into a retry. */
         validity_ssm_exchange (ssm, device, "verify-read-image",
-                               cmd, cmd_len, TRUE,
+                               cmd, cmd_len, FALSE,
                                verify_read_image_cb, NULL);
       }
       break;
 
     case VERIFY_S_DETECT_MINUTIAE:
-      fp_image_detect_minutiae (self->captured_image,
-                                fpi_device_get_cancellable (device),
-                                verify_detect_minutiae_cb, device);
+      /* No minutiae step any more: just reject scans without ridge contrast. */
+      if (!validity_tpl_quality_ok (self->captured_tpl))
+        {
+          fpi_ssm_mark_failed (ssm,
+              fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
+                                        "Not enough ridge detail, please retry"));
+          return;
+        }
+      if (fpi_device_get_current_action (device) == FPI_DEVICE_ACTION_IDENTIFY)
+        {
+          validity_dump_scan (self->captured_tpl, "identify", FP_FINGER_UNKNOWN);
+        }
+      else
+        {
+          FpPrint *enrolled = NULL;
+          fpi_device_get_verify_data (device, &enrolled);
+          validity_dump_scan (self->captured_tpl, "verify",
+                              fp_print_get_finger (enrolled));
+        }
+      fpi_ssm_next_state (ssm);
       break;
 
     case VERIFY_S_MATCH:
       {
+        g_autoptr(ValiditySiftFeatures) probe =
+            validity_sift_extract (self->captured_tpl, VALIDITY_IMAGE_WIDTH,
+                                   VALIDITY_IMAGE_HEIGHT);
         FpPrint *enrolled = NULL;
+        g_autoptr(GVariant) data = NULL;
+        gint threshold = validity_get_match_threshold ();
+        gint best_idx = -1;
         GError *err = NULL;
+        gint score;
+
+        fp_dbg ("scan: %d keypoints", probe->n);
+        if (fpi_device_get_current_action (device) == FPI_DEVICE_ACTION_IDENTIFY)
+          {
+            validity_identify_best (self, device, probe, threshold);
+            fpi_ssm_next_state (ssm);
+            break;
+          }
 
         fpi_device_get_verify_data (device, &enrolled);
-        self->verify_result = fpi_print_bz3_match (
-            enrolled, self->stage_print,
-            validity_get_bz3_threshold (), &err);
-        if (self->verify_result == FPI_MATCH_ERROR)
+        g_object_get (enrolled, "fpi-data", &data, NULL);
+        if (data == NULL)
+          {
+            fpi_ssm_mark_failed (ssm,
+                fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+                    "Stored print has no templates; please enroll again"));
+            return;
+          }
+
+        score = validity_tpl_best_score (probe, data,
+                                         fp_print_get_device_id (enrolled),
+                                         &best_idx, &err);
+        if (score < 0)
           {
             fpi_ssm_mark_failed (ssm, err);
             return;
           }
-        fp_dbg ("verify result: %s (bz3 threshold=%d)",
+        self->verify_score = score;
+        self->verify_result = (score >= threshold) ?
+                              FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
+        fp_dbg ("verify result: %s (%d consistent keypoints with template %d, threshold %d)",
                 self->verify_result == FPI_MATCH_SUCCESS ? "MATCH" : "NO_MATCH",
-                validity_get_bz3_threshold ());
+                score, best_idx, threshold);
         fpi_ssm_next_state (ssm);
       }
       break;
@@ -1566,31 +1231,45 @@ validity_verify_ssm_done (FpiSsm   *ssm,
                           GError   *error)
 {
   FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
+  gboolean identify =
+      fpi_device_get_current_action (device) == FPI_DEVICE_ACTION_IDENTIFY;
 
   g_assert (self->task_ssm == ssm);
   self->task_ssm = NULL;
 
   if (error)
     {
+      /* A retry (bad tap) is a reported result, anything else fails. */
       if (error->domain == FP_DEVICE_RETRY)
         {
-          fpi_device_verify_report (device, FPI_MATCH_ERROR, NULL, error);
-          fpi_device_verify_complete (device, NULL);
+          if (identify)
+            fpi_device_identify_report (device, NULL, NULL, error);
+          else
+            fpi_device_verify_report (device, FPI_MATCH_ERROR, NULL, error);
+          error = NULL;
         }
+      if (identify)
+        fpi_device_identify_complete (device, error);
       else
-        {
-          fpi_device_verify_complete (device, error);
-        }
-      g_clear_object (&self->captured_image);
+        fpi_device_verify_complete (device, error);
       g_clear_object (&self->stage_print);
+      self->identify_match = NULL;
       return;
     }
 
-  fpi_device_verify_report (device, self->verify_result,
-                            g_steal_pointer (&self->stage_print), NULL);
-  fpi_device_verify_complete (device, NULL);
-
-  g_clear_object (&self->captured_image);
+  if (identify)
+    {
+      fpi_device_identify_report (device, self->identify_match,
+                                  g_steal_pointer (&self->stage_print), NULL);
+      fpi_device_identify_complete (device, NULL);
+    }
+  else
+    {
+      fpi_device_verify_report (device, self->verify_result,
+                                g_steal_pointer (&self->stage_print), NULL);
+      fpi_device_verify_complete (device, NULL);
+    }
+  self->identify_match = NULL;
 }
 
 /* --- Enroll SSM --------------------------------------------------------- */
@@ -1630,18 +1309,12 @@ enroll_read_image_cb (FpDevice     *device,
                       gpointer      user_data)
 {
   FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
-  GError *err = NULL;
-  FpImage *image;
+  GError *err = validity_no_image_error (plain, plain_len);
 
-  if (plain_len != VALIDITY_IMAGE_RECORD_LEN)
+  if (err != NULL)
     {
-      g_autofree gchar *hex = validity_hex_prefix (plain, plain_len, 32);
-      g_autoptr(GError) retry = g_error_new (FP_DEVICE_RETRY,
-          FP_DEVICE_RETRY_TOO_SHORT,
-          "device did not return an image (%zu B: %s)", plain_len, hex);
-      fp_dbg ("enroll capture retry: %s", retry->message);
-      fpi_device_enroll_progress (device, self->enroll_completed, NULL,
-                                  g_steal_pointer (&retry));
+      fp_dbg ("enroll capture retry: %s", err->message);
+      fpi_device_enroll_progress (device, self->enroll_completed, NULL, err);
       self->enroll_needs_scan_setup = TRUE;
       if (!enroll_bump_attempts_or_fail (ssm, self))
         return;
@@ -1649,59 +1322,14 @@ enroll_read_image_cb (FpDevice     *device,
       return;
     }
 
-  image = validity_image_from_plaintext (plain, plain_len, &err);
-  if (image == NULL)
+  if (!validity_store_template (self->captured_tpl, plain, &err))
     {
       fpi_ssm_mark_failed (ssm, err);
       return;
     }
 
-  g_clear_object (&self->captured_image);
-  self->captured_image = image;
   fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
   fpi_ssm_next_state (ssm);
-}
-
-static void
-enroll_detect_minutiae_cb (GObject      *source,
-                           GAsyncResult *res,
-                           gpointer      user_data)
-{
-  FpDevice *device = user_data;
-  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
-  g_autoptr(FpPrint) print = NULL;
-  GError *err = NULL;
-
-  if (!fp_image_detect_minutiae_finish (FP_IMAGE (source), res, &err))
-    {
-      fp_dbg ("enroll minutiae retry: %s",
-              err ? err->message : "unknown");
-      g_clear_error (&err);
-      fpi_device_enroll_progress (device, self->enroll_completed, NULL,
-          fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL,
-                                    "Minutiae detection failed, please retry"));
-      self->enroll_needs_scan_setup = TRUE;
-      if (!enroll_bump_attempts_or_fail (self->task_ssm, self))
-        return;
-      fpi_ssm_jump_to_state (self->task_ssm, ENROLL_S_STAGE_BEGIN);
-      return;
-    }
-
-  fp_dbg ("NBIS minutiae extracted: %u",
-          fp_image_get_minutiae (self->captured_image) ?
-          fp_image_get_minutiae (self->captured_image)->len : 0);
-
-  print = fp_print_new (device);
-  fpi_print_set_type (print, FPI_PRINT_NBIS);
-  if (!fpi_print_add_from_image (print, self->captured_image, &err))
-    {
-      fpi_ssm_mark_failed (self->task_ssm, err);
-      return;
-    }
-
-  g_clear_object (&self->stage_print);
-  self->stage_print = g_steal_pointer (&print);
-  fpi_ssm_next_state (self->task_ssm);
 }
 
 static void
@@ -1741,7 +1369,12 @@ validity_enroll_run_state (FpiSsm   *ssm,
         gsize cmd_len;
         g_autofree guint8 *cmd =
             validity_build_enroll_capture_command (
-                device, VALIDITY_CAPTURE_MODE_ENROLL, &cmd_len, &err);
+                device,
+                /* Windows sends mode 0x02 (identify) for the first capture of
+                 * an enrollment and 0x23 (enroll) for every later one. */
+                (self->enroll_completed == 0 && self->enroll_attempts == 0) ?
+                    VALIDITY_CAPTURE_MODE_IDENTIFY : VALIDITY_CAPTURE_MODE_ENROLL,
+                &cmd_len, &err);
         if (cmd == NULL) { fpi_ssm_mark_failed (ssm, err); return; }
         fp_dbg ("enroll stage %d/%d: send capture program",
                 self->enroll_completed + 1, VALIDITY_MAX_ENROLL_STAGES);
@@ -1761,16 +1394,28 @@ validity_enroll_run_state (FpiSsm   *ssm,
         gsize cmd_len;
         g_autofree guint8 *cmd =
             validity_build_enroll_read_image_command (0x2000, &cmd_len);
+        /* check_status=FALSE: a bad scan answers 0x51 with non-zero status
+         * (0x0007); enroll_read_image_cb() turns that into a retry. */
         validity_ssm_exchange (ssm, device, "enroll-read-image",
-                               cmd, cmd_len, TRUE,
+                               cmd, cmd_len, FALSE,
                                enroll_read_image_cb, NULL);
       }
       break;
 
     case ENROLL_S_DETECT_MINUTIAE:
-      fp_image_detect_minutiae (self->captured_image,
-                                fpi_device_get_cancellable (device),
-                                enroll_detect_minutiae_cb, device);
+      /* No minutiae step any more: reject scans without ridge contrast. */
+      if (!validity_tpl_quality_ok (self->captured_tpl))
+        {
+          fpi_device_enroll_progress (device, self->enroll_completed, NULL,
+              fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
+                                        "Not enough ridge detail, please retry"));
+          self->enroll_needs_scan_setup = TRUE;
+          if (!enroll_bump_attempts_or_fail (ssm, self))
+            return;
+          fpi_ssm_jump_to_state (ssm, ENROLL_S_STAGE_BEGIN);
+          return;
+        }
+      fpi_ssm_next_state (ssm);
       break;
 
     case ENROLL_S_STAGE_COMMIT:
@@ -1778,19 +1423,48 @@ validity_enroll_run_state (FpiSsm   *ssm,
         FpPrint *enroll_print = NULL;
 
         fpi_device_get_enroll_data (device, &enroll_print);
-        fpi_print_add_print (enroll_print, self->stage_print);
+        validity_dump_scan (self->captured_tpl, "enroll",
+                            fp_print_get_finger (enroll_print));
+        if (self->enroll_templates == NULL)
+          self->enroll_templates =
+              g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
+        {
+          g_autoptr(ValiditySiftFeatures) feat =
+              validity_sift_extract (self->captured_tpl, VALIDITY_IMAGE_WIDTH,
+                                     VALIDITY_IMAGE_HEIGHT);
+          fp_dbg ("enroll tap: %d keypoints", feat->n);
+          g_ptr_array_add (self->enroll_templates,
+                           validity_sift_serialize (feat));
+        }
+        /* Keep a print to the newest VALIDITY_PRINT_MAX_TAPS taps. */
+        if (self->enroll_templates->len > VALIDITY_PRINT_MAX_TAPS)
+          g_ptr_array_remove_range (self->enroll_templates, 0,
+                                    self->enroll_templates->len -
+                                    VALIDITY_PRINT_MAX_TAPS);
         self->enroll_completed++;
         fp_dbg ("enroll stage %d/%d accepted",
                 self->enroll_completed, VALIDITY_MAX_ENROLL_STAGES);
         fpi_device_enroll_progress (device, self->enroll_completed,
-                                    g_steal_pointer (&self->stage_print),
-                                    NULL);
+                                    NULL, NULL);
         self->enroll_needs_scan_setup = TRUE;
 
         if (self->enroll_completed < VALIDITY_MAX_ENROLL_STAGES)
           fpi_ssm_jump_to_state (ssm, ENROLL_S_STAGE_BEGIN);
         else
-          fpi_ssm_mark_completed (ssm);
+          {
+            GError *err = NULL;
+            GVariant *data = validity_tpl_print_data (
+                self->enroll_templates,
+                fp_print_get_device_id (enroll_print), &err);
+
+            if (data == NULL)
+              {
+                fpi_ssm_mark_failed (ssm, err);
+                return;
+              }
+            g_object_set (enroll_print, "fpi-data", data, NULL);
+            fpi_ssm_mark_completed (ssm);
+          }
       }
       break;
 
@@ -1810,17 +1484,17 @@ validity_enroll_ssm_done (FpiSsm   *ssm,
   g_assert (self->task_ssm == ssm);
   self->task_ssm = NULL;
 
+  g_clear_pointer (&self->enroll_templates, g_ptr_array_unref);
+
   if (error)
     {
       fpi_device_enroll_complete (device, NULL, error);
-      g_clear_object (&self->captured_image);
       g_clear_object (&self->stage_print);
       return;
     }
 
   fpi_device_get_enroll_data (device, &enroll_print);
   fpi_device_enroll_complete (device, g_object_ref (enroll_print), NULL);
-  g_clear_object (&self->captured_image);
 }
 
 /* ===========================================================================
@@ -1986,8 +1660,8 @@ validity_open (FpDevice *device)
    * run the ceremony now to populate them. This covers:
    *   - already-paired devices opened from a wiped storage dir
    *   - users who set VALIDITY0088_FORCE_REPAIR above
-   * The failure-recovery direction (handshake fails -> ceremony -> retry)
-   * is still gated behind VALIDITY0088_RUN_FRESH_PAIR=1 below; this
+   * There is no automatic recovery when the handshake fails (open fails;
+   * VALIDITY0088_FORCE_REPAIR=1 forces a fresh pairing); this
    * backfill path is for the case where the device IS already paired
    * and we just need to repopulate local state. */
   if (!validity_pairing_state_complete ())
@@ -2072,10 +1746,33 @@ validity_enroll (FpDevice *device)
 
   fpi_device_get_enroll_data (device, &enroll_print);
   g_object_get (enroll_print, "fpi-type", &print_type, NULL);
-  if (print_type != FPI_PRINT_NBIS)
-    fpi_print_set_type (enroll_print, FPI_PRINT_NBIS);
+  g_clear_pointer (&self->enroll_templates, g_ptr_array_unref);
 
-  g_clear_object (&self->captured_image);
+  /* Print update (FP_DEVICE_FEATURE_UPDATE_PRINT): libfprint passes an
+   * existing print as template; its taps are kept and the new ones added,
+   * so enrolling a finger again in another sitting widens its coverage. */
+  if (print_type != FPI_PRINT_UNDEFINED)
+    {
+      g_autoptr(GVariant) data = NULL;
+      GError *err = NULL;
+
+      g_object_get (enroll_print, "fpi-data", &data, NULL);
+      if (data != NULL)
+        {
+          self->enroll_templates = validity_tpl_load (
+              data, fp_print_get_device_id (enroll_print), &err);
+          if (self->enroll_templates == NULL)
+            {
+              fpi_device_enroll_complete (device, NULL, err);
+              return;
+            }
+          fp_info ("validity-0088: updating a print with %u taps; adding %d",
+                   self->enroll_templates->len, VALIDITY_MAX_ENROLL_STAGES);
+        }
+    }
+  if (print_type != FPI_PRINT_RAW)
+    fpi_print_set_type (enroll_print, FPI_PRINT_RAW);
+
   g_clear_object (&self->stage_print);
   self->enroll_completed = 0;
   self->enroll_attempts = 0;
@@ -2095,11 +1792,13 @@ validity_verify (FpDevice *device)
 
   validity_cancel_reset (device);
 
-  g_clear_object (&self->captured_image);
   g_clear_object (&self->stage_print);
   self->verify_result = FPI_MATCH_ERROR;
+  self->identify_match = NULL;
 
-  fp_dbg ("starting validity-0088 async verify");
+  fp_dbg ("starting validity-0088 async %s",
+          fpi_device_get_current_action (device) == FPI_DEVICE_ACTION_IDENTIFY ?
+          "identify" : "verify");
 
   self->task_ssm = fpi_ssm_new (device, validity_verify_run_state,
                                 VERIFY_NUM_STATES);
@@ -2171,7 +1870,9 @@ fpi_device_validity_0088_class_init (FpiDeviceValidity0088Class *klass)
   dev_class->close   = validity_close;
   dev_class->enroll  = validity_enroll;
   dev_class->verify  = validity_verify;
+  dev_class->identify = validity_verify;     /* same SSM, see VERIFY_S_MATCH */
   dev_class->cancel  = validity_cancel;
 
   fpi_device_class_auto_initialize_features (dev_class);
+  dev_class->features |= FP_DEVICE_FEATURE_UPDATE_PRINT;
 }

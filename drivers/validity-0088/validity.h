@@ -12,6 +12,58 @@
 
 G_DECLARE_FINAL_TYPE (FpiDeviceValidity0088, fpi_device_validity_0088, FPI, DEVICE_VALIDITY_0088, FpDevice)
 
+/* Hex dump of secrets and session keys for handshake debugging; only built
+ * with -DVALIDITY_TRACE_HANDSHAKE (validity-crypto.c). */
+#ifdef VALIDITY_TRACE_HANDSHAKE
+void validity_debug_hex (const char *label, const guint8 *data, gsize len);
+#else
+#define validity_debug_hex(label, data, len) \
+  G_STMT_START { } G_STMT_END
+#endif
+
+/* Unaligned integer access. Device replies and capture programs are
+ * little-endian; TLS record and handshake headers are big-endian. */
+static inline guint16
+validity_le16 (const guint8 *p)
+{
+  return (guint16) (p[0] | (p[1] << 8));
+}
+
+static inline guint32
+validity_le32 (const guint8 *p)
+{
+  return (guint32) p[0] | ((guint32) p[1] << 8) |
+         ((guint32) p[2] << 16) | ((guint32) p[3] << 24);
+}
+
+static inline guint16
+validity_be16 (const guint8 *p)
+{
+  return (guint16) ((p[0] << 8) | p[1]);
+}
+
+static inline guint32
+validity_be24 (const guint8 *p)
+{
+  return ((guint32) p[0] << 16) | ((guint32) p[1] << 8) | p[2];
+}
+
+static inline void
+validity_put_le16 (guint8 *p, guint16 v)
+{
+  p[0] = v & 0xff;
+  p[1] = v >> 8;
+}
+
+static inline void
+validity_put_le32 (guint8 *p, guint32 v)
+{
+  p[0] = v & 0xff;
+  p[1] = (v >> 8) & 0xff;
+  p[2] = (v >> 16) & 0xff;
+  p[3] = (v >> 24) & 0xff;
+}
+
 /* ===========================================================================
  * USB transport
  * ========================================================================= */
@@ -29,6 +81,9 @@ G_DECLARE_FINAL_TYPE (FpiDeviceValidity0088, fpi_device_validity_0088, FPI, DEVI
 
 #define VALIDITY_MAX_RECV_LEN          24576  /* > 18960 to fit per-attempt records */
 #define VALIDITY_MAX_ENROLL_STAGES        10
+/* Upper limit of taps kept in one print (print updates add 10 each time;
+ * ~33 KB per tap). The oldest taps are dropped first. */
+#define VALIDITY_PRINT_MAX_TAPS           30
 
 /* ===========================================================================
  * Protocol constants
@@ -86,7 +141,7 @@ G_DECLARE_FINAL_TYPE (FpiDeviceValidity0088, fpi_device_validity_0088, FPI, DEVI
 /* Client-direction prefix on TLS handshake records (NOT on app_data) */
 extern const guint8 validity_client_handshake_prefix[4];  /* = { 0x44, 0x00, 0x00, 0x00 } */
 
-/* Low-level USB bulk transfer wrappers — defined in validity.c, used from
+/* Low-level USB bulk transfer wrappers — defined in validity-transport.c, used from
  * other driver source files including validity-pretls-pair.c. */
 gboolean validity_usb_write (FpDevice     *dev,
                              const guint8 *data,
@@ -115,39 +170,12 @@ extern const guint8 validity_init_msg4_clean_slate_payload[VALIDITY_INIT_MSG4_CL
 gboolean validity_pairing_run_pretls_fresh_pair_ceremony (FpDevice *dev,
                                                           GError  **error);
 
-/* Enroll-time HOSTPART payload (10500 B). See validity-enroll-data.c.
- * The clean-slate variant is shipped but not auto-selected; the
- * 0x4302 probe in validity_send_plaintext_init would be the trigger
- * if a future 0088 ever returns non-zero from it. */
+/* Enroll-time HOSTPART payload (10500 B). See validity-enroll-data.c. */
 #define VALIDITY_ENROLL_HOSTPART_BLOB_LEN  10500
 extern const guint8 validity_enroll_hostpart_blob[VALIDITY_ENROLL_HOSTPART_BLOB_LEN];
-extern const guint8 validity_enroll_hostpart_blob_clean_slate[VALIDITY_ENROLL_HOSTPART_BLOB_LEN];
 
-/* ===========================================================================
- * Pinned attestation keys (embedded; raw bytes in validity-pubkeys.c).
- * Family-wide constants, same on every 0088 device.
- * ========================================================================= */
-
-/* RSA-2048: F4 exponent. Modulus is in validity_rsa_modulus_a / _b. */
-#define VALIDITY_RSA_EXPONENT     0x10001u
-#define VALIDITY_RSA_MODULUS_LEN  256
-
-extern const guint8 validity_rsa_modulus_a[VALIDITY_RSA_MODULUS_LEN];
-extern const guint8 validity_rsa_modulus_b[VALIDITY_RSA_MODULUS_LEN];
-extern const guint8 validity_rsa_modulus_a_sha256[32];
-extern const guint8 validity_rsa_modulus_b_sha256[32];
-
-/* ECC P-256 attestation key (the only entry in the default table). */
+/* P-256 coordinate length. */
 #define VALIDITY_ECC_COORD_LEN  32
-extern const guint8 validity_ecc_pubkey_x[VALIDITY_ECC_COORD_LEN];
-extern const guint8 validity_ecc_pubkey_y[VALIDITY_ECC_COORD_LEN];
-
-/* Maps a device-ID 3-byte prefix to a pinned key. Currently:
- *   prefix 06 03 01           -> Key B
- *   all other 06 xx xx        -> Key A
- *   06 07 00 (default table)  -> ECC key
- */
-const guint8 *validity_pick_rsa_modulus_for_device_id (const guint8 device_prefix[3]);
 
 /* ===========================================================================
  * Image record (device → host, inside an encrypted TLS app_data record)
@@ -202,8 +230,8 @@ validity_image_record_validate (const ValidityImageRecord *img)
  * device runs in EOH-MOH-StgOnHost mode — feature-extraction happens
  * on the device, but MATCHING happens on the HOST. The "match_result"
  * field below is really an "image-features-extracted-OK" status; the
- * actual match decision is made by libfprint's NBIS matcher against
- * its template database, NOT by the device. */
+ * match decision is made on the host (validity-sift.c), NOT by the
+ * device. */
 #define VALIDITY_MATCH_RESULT_INIT          0x00000000u  /* uninit / first response */
 #define VALIDITY_MATCH_RESULT_PROBE         0x00000080u  /* touch detected, capture in progress */
 #define VALIDITY_MATCH_RESULT_FEATURES_OK   0x00000085u  /* image captured + features extracted */
@@ -267,6 +295,30 @@ typedef enum {
   VALIDITY_CAPTURE_MODE_IDENTIFY = 0x02,
   VALIDITY_CAPTURE_MODE_ENROLL   = 0x23,
 } ValidityCaptureMode;
+
+/* Native calibration (validity-capture-builder.c). */
+#define VALIDITY_OP_READ_CONFIG   0x6f
+#define VALIDITY_CAL_ROWS         56u
+#define VALIDITY_CAL_STRIDE       152u   /* 8 B line header + 144 px */
+#define VALIDITY_CAL_ROW_HDR      8u
+#define VALIDITY_CAL_FRAME_LEN    (VALIDITY_CAL_ROWS * VALIDITY_CAL_STRIDE)
+#define VALIDITY_CAL_TRIM_LEN     56u
+#define VALIDITY_CAL_RAW_LINES    337u   /* 3 passes x 112 lines + 1 */
+#define VALIDITY_CAL_RAW_LEN      (VALIDITY_CAL_RAW_LINES * VALIDITY_CAL_STRIDE)
+
+typedef struct {
+  gboolean valid;
+  gboolean have_baseline;
+  guint8   trim[VALIDITY_CAL_TRIM_LEN];
+  guint8   frame[VALIDITY_CAL_FRAME_LEN];
+  guint8   baseline[VALIDITY_CAL_FRAME_LEN];
+} ValidityCalibration;
+
+typedef enum {
+  VALIDITY_CAL_PROG_CAL1,      /* first calibration capture, no frame data */
+  VALIDITY_CAL_PROG_CAL2,      /* second calibration capture, frame applied */
+  VALIDITY_CAL_PROG_CAPTURE,   /* normal capture program */
+} ValidityCalProgram;
 
 /* ===========================================================================
  * Session state
@@ -394,20 +446,7 @@ guint8 *validity_build_client_hello (
     ValiditySession *session,
     gsize           *out_len);
 
-/* Build the identify/match command payload (wire byte 0x5e). The
- * "payload" arg is the encrypted template push (~18851 B). */
-guint8 *validity_build_identify_command (
-    guint8        flag1,
-    guint8        flag2,
-    guint16       field_a,
-    guint16       field_b,
-    guint16       field_c,
-    const guint8 *payload, guint32 payload_len,
-    gsize        *out_len);
-
-/* Single-byte wire commands. Both produce malloc'd 1-byte buffers
- * `[0x50]` and `[0x1A]` respectively; caller g_frees. */
-guint8 *validity_build_enroll_begin_command (gsize *out_len);
+/* Single-byte wire command `[0x1A]`; caller g_frees. */
 guint8 *validity_build_enroll_session_command (gsize *out_len);
 guint8 *validity_build_enroll_read_image_command (guint32 mode,
                                                   gsize  *out_len);
@@ -440,6 +479,28 @@ guint8 *validity_capture_build (const ValidityRomInfo *rom_info,
                                 ValidityCaptureMode    mode,
                                 gsize                 *out_len,
                                 GError               **error);
+guint8  *validity_cal_build_program (const guint8              *tmpl,
+                                     gsize                      tmpl_len,
+                                     const ValidityCalibration *cal,
+                                     ValidityCalProgram         kind,
+                                     gsize                     *out_len,
+                                     GError                   **error);
+guint8  *validity_cal_build_from_template (const ValidityCalibration *cal,
+                                           ValidityCalProgram         kind,
+                                           gsize                     *out_len,
+                                           GError                   **error);
+gboolean validity_cal_parse_config_response (const guint8 *plain,
+                                             gsize         plain_len,
+                                             guint8       *trim,
+                                             GError      **error);
+gboolean validity_cal_frame_from_raw (const guint8 *raw,
+                                      gsize         raw_len,
+                                      guint8       *frame,
+                                      GError      **error);
+gboolean validity_cal_frame_plausible (const guint8 *frame, gdouble *mean_out);
+gboolean validity_cal_save (const ValidityCalibration *cal, GError **error);
+gboolean validity_cal_load (ValidityCalibration *cal, GError **error);
+void     validity_cal_dump (const gchar *name, const guint8 *data, gsize len);
 guint8 *validity_build_enroll_capture_command (FpDevice            *dev,
                                                ValidityCaptureMode  mode,
                                                gsize               *out_len,
@@ -465,9 +526,9 @@ gboolean validity_send_host_part_read  (FpDevice  *dev,
 /* Cert blob acquisition via wire 0x4f (P1 / PAIRING.md).
  *
  * If @out_status is non-NULL, the device's 2-byte response status word
- * is always written there (big-endian as logged), regardless of whether
+ * is always written there (little-endian), regardless of whether
  * the function returns TRUE or FALSE. Callers use this to distinguish
- * "device rejected because already paired" (status 0x0104) from generic
+ * "device rejected because already paired" (status 0x0401) from generic
  * I/O failures. */
 gboolean validity_send_cert_acquisition (FpDevice  *dev,
                                          guint8    out_cert_blob[0xb8],
@@ -477,19 +538,60 @@ gboolean validity_send_cert_acquisition (FpDevice  *dev,
 /* Status meanings observed live on 06cb:0088. Add new entries as they're
  * encountered. */
 #define VALIDITY_STATUS_OK                       0x0000u
-#define VALIDITY_STATUS_CERT_ALREADY_ISSUED      0x0104u  /* 0x4f rejection: device has an existing cert context */
+#define VALIDITY_STATUS_CERT_ALREADY_ISSUED      0x0401u  /* 0x4f rejection (wire bytes 01 04): device has an existing cert context */
 #define VALIDITY_STATUS_FLASH_ERASE_NOT_ALLOWED  0x04afu  /* 0x3f rejection: partition cannot be erased in current state */
+#define VALIDITY_STATUS_FWEXT_NOT_LOADED         0x04afu  /* get_fw_info(fwext) on every working unit; harmless */
 
-/* Internal encrypted app-data exchange helpers (validity.c). These route
- * through validity_usb_write(), which enforces the 06cb:0088 defensive
- * write guard before any USB OUT transfer. */
+/* Per-device state owned by validity.c. */
 ValiditySession *validity_device_get_session (FpDevice *dev);
+GCancellable    *validity_device_get_interrupt_cancellable (FpDevice *dev);
+
+/* Internal encrypted app-data exchange helpers (validity-transport.c).
+ * These route through validity_usb_write(), which enforces the 06cb:0088
+ * defensive write guard before any USB OUT transfer. */
 gboolean validity_exchange_app_plaintext (FpDevice     *dev,
                                           const guint8 *plain,
                                           gsize         plain_len,
                                           guint8      **out_rsp,
                                           gsize        *out_rsp_len,
                                           GError      **error);
+/* Exchange @plain and fail unless the reply status word is 0. */
+gboolean validity_exchange_and_check_status (FpDevice     *dev,
+                                             const gchar  *label,
+                                             const guint8 *plain,
+                                             gsize         plain_len,
+                                             GError      **error);
+
+/* Hex string of the first @max_len bytes of @data, "..." if truncated. */
+gchar *validity_hex_prefix (const guint8 *data,
+                            gsize         len,
+                            gsize         max_len);
+
+/* Async versions for the task SSMs (validity-transport.c). */
+typedef void (*ValidityAsyncRecvCb) (FpDevice     *device,
+                                     FpiSsm       *ssm,
+                                     const guint8 *plain,
+                                     gsize         plain_len,
+                                     gpointer      user_data);
+
+/* Submit one encrypted round-trip: encrypt plain, USB OUT, USB IN, decrypt.
+ * If cb is NULL: on success, advance ssm to next state (after the optional
+ * 2-byte status word check); on error, mark ssm failed.
+ * If cb is non-NULL: invoke cb with the decrypted plaintext; cb owns the
+ * SSM state transition. */
+void validity_ssm_exchange (FpiSsm              *ssm,
+                            FpDevice            *device,
+                            const gchar         *label,
+                            const guint8        *plain,
+                            gsize                plain_len,
+                            gboolean             check_status,
+                            ValidityAsyncRecvCb  cb,
+                            gpointer             cb_data);
+
+/* Wait on EP 0x83 for a finger event, reporting finger status; advances
+ * @ssm once the tap is complete. Cancelled by the interrupt cancellable. */
+void validity_async_submit_interrupt_read (FpiSsm   *ssm,
+                                           FpDevice *device);
 /* LED mode flags written to u32 LE at payload+1 of the 0x39 glow command. */
 #define LED_MODE_STEADY   0u   /* solid, no animation */
 #define LED_MODE_SOLID    1u   /* single ramp/pulse */
@@ -515,11 +617,6 @@ guint8 *validity_build_led_glow_command (guint8  r,
                                          guint32 mode,
                                          guint16 timing_ms,
                                          gsize  *out_len);
-
-/* Parse a hex string into a 125-byte raw LED payload (for env-var override).
- * Returns g_malloc'd buffer or NULL on malformed input. */
-guint8 *validity_parse_led_raw_payload (const gchar *hex_str,
-                                        gsize       *out_len);
 
 /* ===========================================================================
  * Pairing / host identity (validity-pairing.c)
@@ -551,7 +648,6 @@ gboolean validity_pairing_load_host_uuid     (guint8 out[VALIDITY_HOST_UUID_LEN]
 /* Persistent host ECDSA P-256 keypair. EVP_PKEY * must be EVP_PKEY_free'd. */
 struct evp_pkey_st; /* forward decl; <openssl/evp.h> provides the real one */
 typedef struct evp_pkey_st EVP_PKEY;
-EVP_PKEY *validity_pairing_generate_host_keypair (GError **error);
 gboolean  validity_pairing_save_host_keypair     (EVP_PKEY *pkey, GError **error);
 EVP_PKEY *validity_pairing_load_host_keypair     (GError **error);
 
@@ -559,13 +655,6 @@ gboolean  validity_pairing_get_pubkey_xy (EVP_PKEY *pkey,
                                           guint8    x_be[VALIDITY_ECC_COORD_LEN],
                                           guint8    y_be[VALIDITY_ECC_COORD_LEN],
                                           GError  **error);
-
-/* Build the Synaptics 192-byte client Certificate body. Caller g_free's. */
-guint8 *validity_pairing_build_client_certificate (
-    const guint8 host_pubkey_x_be[VALIDITY_ECC_COORD_LEN],
-    const guint8 host_pubkey_y_be[VALIDITY_ECC_COORD_LEN],
-    const guint8 signature_trailer[VALIDITY_CLIENT_CERT_SIG_LEN],
-    const guint8 session_random[4]);
 
 /* Machine GUID continuity check (CeivMode::ValidateDatabase equivalent).
  * Checks whether the host UUID matches the one recorded during the
@@ -621,15 +710,10 @@ gboolean validity_pairing_derive_osb   (const guint8  host_part[16],
                                          gsize         tag4_len,
                                          guint8       *out_osb);
 gboolean validity_pairing_save_osb     (const guint8 osb[32], GError **error);
-gboolean validity_pairing_load_osb     (guint8 out[32], GError **error);
 gboolean validity_pairing_has_osb      (void);
 
-/* Enroll bootstrap wire-0x06 body cache.
- * Stores the 10500-byte body without the outer opcode byte; command builders
- * wrap it as 0x06 + body. See */
-gboolean validity_pairing_save_enroll_hostpart_blob (const guint8 *blob,
-                                                     gsize         len,
-                                                     GError      **error);
+/* Enroll bootstrap wire-0x06 body cache: the 10500-byte body without the
+ * outer opcode byte; command builders wrap it as 0x06 + body. */
 guint8 * validity_pairing_load_enroll_hostpart_blob (gsize   *out_len,
                                                      GError **error);
 gboolean validity_pairing_has_enroll_hostpart_blob  (void);

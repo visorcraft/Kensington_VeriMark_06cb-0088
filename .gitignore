@@ -1,0 +1,4 @@
+.gitignore# Scan dumps (VALIDITY0088_DUMP_SCANS) are biometric data: never commit them.
+*.pgm
+# Local libfprint checkout and build (packaging/build-libfprint.sh).
+/build/

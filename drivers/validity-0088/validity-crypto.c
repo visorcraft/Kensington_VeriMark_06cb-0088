@@ -27,10 +27,10 @@
 #include <openssl/sha.h>
 
 #ifdef VALIDITY_TRACE_HANDSHAKE
-static void
-debug_hex (const char   *label,
-           const guint8 *data,
-           gsize         len)
+void
+validity_debug_hex (const char   *label,
+                    const guint8 *data,
+                    gsize         len)
 {
   GString *hex = g_string_sized_new (len * 2);
 
@@ -40,9 +40,6 @@ debug_hex (const char   *label,
   fp_dbg ("%s len=%zu hex=%s", label, len, hex->str);
   g_string_free (hex, TRUE);
 }
-#else
-#define debug_hex(label, data, len) \
-  G_STMT_START { } G_STMT_END
 #endif
 
 /* ===========================================================================
@@ -146,19 +143,19 @@ validity_derive_session_keys (ValiditySession *session,
   memcpy (session->client_write_key,     key_block + 64,       32);
   memcpy (session->server_write_key,     key_block + 96,       32);
 
-  debug_hex ("KDF seed client_random||server_random", seed, sizeof (seed));
-  debug_hex ("KDF pre_master_secret", pre_master_secret, pre_master_secret_len);
-  debug_hex ("KDF master_secret", session->master_secret,
-             VALIDITY_MASTER_SECRET_LEN);
-  debug_hex ("KDF key_block", key_block, sizeof (key_block));
-  debug_hex ("KDF client_write_mac_key", session->client_write_mac_key,
-             VALIDITY_MAC_KEY_LEN);
-  debug_hex ("KDF server_write_mac_key", session->server_write_mac_key,
-             VALIDITY_MAC_KEY_LEN);
-  debug_hex ("KDF client_write_key", session->client_write_key,
-             VALIDITY_ENC_KEY_LEN);
-  debug_hex ("KDF server_write_key", session->server_write_key,
-             VALIDITY_ENC_KEY_LEN);
+  validity_debug_hex ("KDF seed client_random||server_random", seed, sizeof (seed));
+  validity_debug_hex ("KDF pre_master_secret", pre_master_secret, pre_master_secret_len);
+  validity_debug_hex ("KDF master_secret", session->master_secret,
+                      VALIDITY_MASTER_SECRET_LEN);
+  validity_debug_hex ("KDF key_block", key_block, sizeof (key_block));
+  validity_debug_hex ("KDF client_write_mac_key", session->client_write_mac_key,
+                      VALIDITY_MAC_KEY_LEN);
+  validity_debug_hex ("KDF server_write_mac_key", session->server_write_mac_key,
+                      VALIDITY_MAC_KEY_LEN);
+  validity_debug_hex ("KDF client_write_key", session->client_write_key,
+                      VALIDITY_ENC_KEY_LEN);
+  validity_debug_hex ("KDF server_write_key", session->server_write_key,
+                      VALIDITY_ENC_KEY_LEN);
 
   /* Zero the seed buffer */
   memset (seed,      0, sizeof (seed));
@@ -229,8 +226,8 @@ validity_encrypt_record (ValiditySession *session,
                       plaintext,
                       (guint16) plaintext_len,
                       mac);
-  debug_hex ("ENCRYPT plaintext", plaintext, plaintext_len);
-  debug_hex ("ENCRYPT mac", mac, sizeof (mac));
+  validity_debug_hex ("ENCRYPT plaintext", plaintext, plaintext_len);
+  validity_debug_hex ("ENCRYPT mac", mac, sizeof (mac));
 
   /* 2. CBC padding: pad_len + 1 trailing bytes, each = pad_len. */
   gsize to_pad = plaintext_len + VALIDITY_MAC_OUTPUT_LEN;
@@ -246,7 +243,7 @@ validity_encrypt_record (ValiditySession *session,
 
   /* 3. Random explicit IV. */
   RAND_bytes (iv, VALIDITY_AES_BLOCK_SIZE);
-  debug_hex ("ENCRYPT explicit_iv", iv, sizeof (iv));
+  validity_debug_hex ("ENCRYPT explicit_iv", iv, sizeof (iv));
 
   /* 4. AES-256-CBC encrypt. */
   ctx = EVP_CIPHER_CTX_new ();
@@ -274,7 +271,7 @@ validity_encrypt_record (ValiditySession *session,
   record[4] = fragment_size & 0xff;
   memcpy (record + 5, iv, VALIDITY_AES_BLOCK_SIZE);
   memcpy (record + 5 + VALIDITY_AES_BLOCK_SIZE, ciphertext, body_len);
-  debug_hex ("ENCRYPT record", record, record_len);
+  validity_debug_hex ("ENCRYPT record", record, record_len);
 
   g_free (body);
   g_free (ciphertext);
