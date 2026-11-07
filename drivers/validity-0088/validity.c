@@ -42,6 +42,7 @@ struct _FpiDeviceValidity0088
   gint               enroll_completed;
   gint               enroll_attempts;
   gboolean           enroll_needs_scan_setup;
+  gboolean           capture_armed;      /* capture program sent, image not read */
   ValidityCalibration *cal_work;         /* non-NULL while calibrating */
 };
 
@@ -953,6 +954,11 @@ validity_capture_response_cb (FpDevice     *device,
               match->score, match->minutia_count, match->threshold,
               match->probe_flag, match->match_result);
     }
+
+  /* The capture program is now running on the sensor. If the operation is
+   * cancelled before READ_IMAGE, the sensor stays armed and rejects the next
+   * capture program with a USB STALL; see validity_close(). */
+  FPI_DEVICE_VALIDITY_0088 (device)->capture_armed = TRUE;
   fpi_ssm_next_state (ssm);
 }
 
@@ -978,6 +984,10 @@ verify_read_image_cb (FpDevice     *device,
 {
   FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
   GError *err = validity_no_image_error (plain, plain_len);
+
+  /* READ_IMAGE ends the capture regardless of the result (status 0x0007
+   * means "no image", not "still armed"). */
+  self->capture_armed = FALSE;
 
   if (err == NULL)
     validity_store_template (self->captured_tpl, plain, &err);
@@ -1311,6 +1321,9 @@ enroll_read_image_cb (FpDevice     *device,
   FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
   GError *err = validity_no_image_error (plain, plain_len);
 
+  /* READ_IMAGE ends the capture regardless of the result. */
+  self->capture_armed = FALSE;
+
   if (err != NULL)
     {
       fp_dbg ("enroll capture retry: %s", err->message);
@@ -1589,6 +1602,7 @@ validity_open (FpDevice *device)
 
   self->interrupt_cancellable = g_cancellable_new ();
   self->phase = VALIDITY_PHASE_PLAINTEXT_INIT;
+  self->capture_armed = FALSE;
   validity_session_clear_fresh_pair (&self->session);
   memset (&self->session, 0, sizeof (self->session));
 
@@ -1717,6 +1731,8 @@ static void
 validity_close (FpDevice *device)
 {
   FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
+  GUsbDevice *usb_dev = fpi_device_get_usb_device (device);
+  gboolean was_armed = self->capture_armed;
   GError *error = NULL;
 
   if (self->session.handshake_hash_ctx)
@@ -1728,8 +1744,26 @@ validity_close (FpDevice *device)
   validity_session_clear_fresh_pair (&self->session);
   memset (&self->session, 0, sizeof (self->session));
 
-  g_usb_device_release_interface (fpi_device_get_usb_device (device),
-                                  0, 0, &error);
+  g_usb_device_release_interface (usb_dev, 0, 0, &error);
+
+  /* An operation cancelled between sending the capture program and reading
+   * the image leaves the sensor armed: the capture program keeps running and
+   * the firmware STALLs the next upload. A USB reset puts it back into a
+   * clean state, so the next session does not fail with
+   * "endpoint stalled or request not supported". */
+  if (was_armed)
+    {
+      g_autoptr(GError) reset_error = NULL;
+
+      fp_info ("validity-0088: capture still armed at close; resetting sensor");
+      if (g_usb_device_reset (usb_dev, &reset_error))
+        fp_dbg ("sensor reset after aborted capture succeeded");
+      else
+        fp_warn ("sensor reset after aborted capture failed: %s",
+                 reset_error ? reset_error->message : "unknown");
+      self->capture_armed = FALSE;
+    }
+
   fpi_device_close_complete (device, error);
 }
 
