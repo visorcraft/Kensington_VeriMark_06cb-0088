@@ -447,7 +447,9 @@ validity_sift_extract (const guint8 *img, gint w, gint h)
   {
     gint n = xy->len / 2, keep = MIN (n, VS_KEEP);
     g_autofree gint *order = g_new (gint, n);
-    const gfloat *r = (const gfloat *) resp->data;
+    /* GArray::data is a byte pointer. A float cast trips clang -Wcast-align;
+     * the copy is the same values, aligned. */
+    g_autofree gfloat *r = g_memdup2 (resp->data, (gsize) n * sizeof (gfloat));
 
     for (gint i = 0; i < n; i++)
       order[i] = i;
@@ -461,7 +463,7 @@ validity_sift_extract (const guint8 *img, gint w, gint h)
         f->xy[2 * i] = g_array_index (xy, gfloat, 2 * o);
         f->xy[2 * i + 1] = g_array_index (xy, gfloat, 2 * o + 1);
         memcpy (f->desc + (gsize) i * VS_DESC_LEN,
-                (const gfloat *) desc->data + (gsize) o * VS_DESC_LEN,
+                desc->data + (gsize) o * VS_DESC_LEN * sizeof (gfloat),
                 VS_DESC_LEN * sizeof (gfloat));
       }
   }

@@ -160,6 +160,22 @@ It is separate from the examples' `~/.local/share/libfprint/verimark-06cb-0088/`
 so fprintd calibrates once on its first enroll or verify. Prints:
 `/var/lib/fprint/<user>/validity-0088/<device id>/<finger>`.
 
+fprintd cannot read the examples' directory (`ProtectHome=yes` hides home),
+so its first enroll runs the pairing ceremony again even when the examples
+have already paired this key. Copy that pairing into fprintd's storage
+instead. `~` below is the user who ran the examples:
+
+```bash
+sudo systemctl stop fprintd
+sudo install -d -m 700 /var/lib/fprint/validity-0088-pairing
+sudo cp -a ~/.local/share/libfprint/verimark-06cb-0088/. /var/lib/fprint/validity-0088-pairing/
+sudo chown -R root:root /var/lib/fprint/validity-0088-pairing
+sudo systemctl restart fprintd
+```
+
+The copy includes `cert-blob`, `host-key.pem`, `device-ecdh-pubkey.bin` and,
+when the examples calibrated, `calibration.bin`.
+
 Without systemd (OpenRC, runit …) the driver uses root's
 `~/.local/share/libfprint/verimark-06cb-0088/` and the `print-key` file;
 `setup-fprintd.sh` itself needs systemd.

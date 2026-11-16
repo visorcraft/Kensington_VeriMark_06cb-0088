@@ -32,11 +32,17 @@ jobs:
         run: tests/check-repo.sh
 
   build-and-test:
-    name: ${{ matrix.image }} / libfprint ${{ matrix.libfprint }}
+    name: ${{ matrix.image }} / libfprint ${{ matrix.libfprint }}${{ matrix.cc == 'clang' && ' / clang' || '' }}
     runs-on: ubuntu-24.04
     container: ${{ matrix.image }}
     timeout-minutes: 30
     continue-on-error: ${{ matrix.experimental }}
+    env:
+      # Clang compiles the C driver. C++ stays g++ on every job: clang++
+      # follows whichever GCC install it detects, and a partial newer GCC
+      # (headers without libstdc++) makes that link fail.
+      CC: ${{ matrix.cc }}
+      CXX: g++
     strategy:
       fail-fast: false
       matrix:
@@ -51,11 +57,21 @@ jobs:
           - "rockylinux/rockylinux:10"
         libfprint: [release]
         experimental: [false]
+        cc: [gcc]
         include:
           # upstream development branch: an early warning, allowed to fail
           - image: "ubuntu:24.04"
             libfprint: master
             experimental: true
+            cc: gcc
+          # Clang rejects a goto that jumps past a cleanup attribute
+          # (g_autofree / g_autoptr). GCC compiles that and the cleanup
+          # then frees an uninitialised pointer. The driver is C; C++ stays
+          # g++, which is what the other jobs already use.
+          - image: "ubuntu:24.04"
+            libfprint: release
+            experimental: false
+            cc: clang
     steps:
       - name: Prepare container
         # bash and the scripts are not in the container before checkout
@@ -65,6 +81,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Base packages
         run: .github/ci/prepare-container.sh
+      - name: Clang
+        if: matrix.cc == 'clang'
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          if command -v apt-get >/dev/null; then apt-get install -y -q clang
+          else dnf install -y -q clang; fi
       - name: Build libfprint with the driver
         run: |
           if [ "${{ matrix.libfprint }}" = release ]; then

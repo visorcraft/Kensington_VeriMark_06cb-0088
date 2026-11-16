@@ -19,6 +19,7 @@ about 15 seconds.
 | `test-print` | Print encryption (round trip, other device, tampered key id / nonce / ciphertext / tag, credential vs. key file, missing and broken keys), the print-data fallback, and all print formats (format 2, format 1, legacy raw scans) scored with the driver's code, plus loading a print for a print update |
 | `test-capture-builder` | Capture and calibration programs from fixed synthetic calibrations against SHA-256 values (identical for the old full upstream template and the current skeleton), refusal of an incompatible trim, missing calibration, `calibration.bin` round trip, capture mode byte |
 | `test-pairing-key` | The pairing signing key: scalar 1 gives the P-256 base point G (known answer), random scalars, signatures, the derived `hs_key` |
+| `test-pretls-fail` | A USB failure at the start of the fresh-pair ceremony returns that error. Jumping to cleanup past uninitialised `g_autofree` pointers aborts here instead |
 | `test-setup-fprintd` | `packaging/setup-fprintd.sh` in a sandbox with stand-ins for `systemctl` and `systemd-creds`: every option and its error cases. Needs root or unprivileged user namespaces (`unshare -r`), otherwise skipped |
 | `shellcheck` | The shell scripts, if `shellcheck` is installed |
 
@@ -33,15 +34,21 @@ weekly (to notice new libfprint releases):
 - **Build and test** in containers: Ubuntu 24.04, Debian 12 and 13, Fedora
   42, Rocky Linux 9 and 10, each against the latest libfprint release; Ubuntu also
   against libfprint `master` (allowed to fail: an early warning about
-  upstream changes). Each job runs `packaging/build-libfprint.sh
-  --install-deps`, fails on any compiler warning in the driver, runs
-  `tests/run.sh` and uploads the logs when it fails.
+  upstream changes) and once more with `CC=clang` (C++ stays `g++`). Clang
+  rejects a `goto` that jumps past a `g_autofree` or `g_autoptr` variable;
+  GCC compiles that, and the cleanup then frees an uninitialised pointer.
+  GCC `-Wjump-misses-init` is not enabled: error paths jump forward over
+  ordinary initialisers, so the warning is noisy and does not catch this.
+  Each job runs `packaging/build-libfprint.sh --install-deps`, fails on any
+  compiler warning in the driver, runs `tests/run.sh` and uploads the logs
+  when it fails.
 
 The same jobs run locally with podman or docker before pushing:
 
 ```bash
-.github/ci/run-local.sh                  # all images
+.github/ci/run-local.sh                  # all images, plus clang on Ubuntu
 .github/ci/run-local.sh fedora:42        # one image
+.github/ci/run-local.sh clang            # Ubuntu with CC=clang
 ```
 
 Last local run (2026-10-20): lint and all six distributions passed

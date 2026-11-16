@@ -299,6 +299,15 @@ validity_pairing_run_pretls_fresh_pair_ceremony (FpDevice *dev, GError **error)
   EVP_PKEY *fresh_pkey = NULL;
   EVP_PKEY *hs_pkey = NULL;
   gboolean ok = FALSE;
+  /* Declared (and NULL-initialised) up front: the early `goto out` paths
+   * before step 10 must not jump past g_autofree declarations, or their
+   * cleanup frees uninitialised stack values ("free(): invalid pointer")
+   * and the GError from the failed step is lost. g_free(NULL) is a no-op,
+   * so those paths still return the error they set. */
+  g_autofree gchar *dir = NULL;
+  g_autofree gchar *cert_path = NULL;
+  g_autofree gchar *key_path = NULL;
+  g_autofree gchar *ecdh_path = NULL;
 
   fp_info ("=== pre-TLS fresh-pair ceremony starting ===");
 
@@ -507,13 +516,13 @@ validity_pairing_run_pretls_fresh_pair_ceremony (FpDevice *dev, GError **error)
   g_clear_pointer (&resp, g_free);
 
   /* Step 10: persist cert + priv + ECDH pubkey to disk */
-  g_autofree gchar *dir = validity_pairing_get_storage_dir ();
+  dir = validity_pairing_get_storage_dir ();
   if (!validity_pairing_ensure_storage_dir (error))
     goto out;
 
-  g_autofree gchar *cert_path = g_build_filename (dir, "cert-blob", NULL);
-  g_autofree gchar *key_path  = g_build_filename (dir, "host-key.pem", NULL);
-  g_autofree gchar *ecdh_path = g_build_filename (dir, "device-ecdh-pubkey.bin", NULL);
+  cert_path = g_build_filename (dir, "cert-blob", NULL);
+  key_path  = g_build_filename (dir, "host-key.pem", NULL);
+  ecdh_path = g_build_filename (dir, "device-ecdh-pubkey.bin", NULL);
 
   if (!write_file_secret (cert_path, signed_cert_copy, 184, error))
     goto out;

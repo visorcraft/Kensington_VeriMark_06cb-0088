@@ -101,7 +101,7 @@ if want test-matcher; then
 fi
 
 LF="$(libfprint_flags || true)"
-for t in test-print test-capture-builder test-pairing-key; do
+for t in test-print test-capture-builder test-pairing-key test-pretls-fail; do
     want "$t" || continue
     if [ -z "$LF" ]; then
         report "$t" SKIP "(no libfprint build: run packaging/build-libfprint.sh)"
@@ -119,6 +119,10 @@ for t in test-print test-capture-builder test-pairing-key; do
                 && run_binary "$t" "$OUT/$t" ;;
         test-pairing-key)
             build "$t" "$T/test-pairing-key.c" "$T/stubs.c" "$T/stubs-usb.c" \
+                "$DRV/validity-init-clean-slate.c" -- $LF \
+                && run_binary "$t" "$OUT/$t" ;;
+        test-pretls-fail)
+            build "$t" "$T/test-pretls-fail.c" "$T/stubs.c" \
                 "$DRV/validity-init-clean-slate.c" -- $LF \
                 && run_binary "$t" "$OUT/$t" ;;
     esac
