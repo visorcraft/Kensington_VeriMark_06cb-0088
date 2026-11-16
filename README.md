@@ -13,7 +13,7 @@ No Windows driver, registry data or capture files are needed.
 
 | | Systems |
 |---|---|
-| Built and tested in CI | Ubuntu 24.04, Debian 12 and 13, Fedora 42, Rocky Linux 9 and 10 — against the latest libfprint release ([details](docs/testing.md#continuous-integration)) |
+| Built and tested in CI | Ubuntu 24.04, Debian 12 and 13, Fedora 42, Rocky Linux 9 and 10 — against the latest libfprint release, plus clang on Ubuntu 24.04 ([details](docs/testing.md#continuous-integration)) |
 | Tested with the device | Linux Mint (Ubuntu 24.04 base) with fprintd 1.94.3 |
 | Should work | Other systemd-based distributions with libfprint ≥ 1.94; the build script installs dependencies on the Debian and RHEL families, elsewhere install them yourself ([Arch](docs/packaging.md#other-distributions)) |
 
@@ -99,6 +99,7 @@ Start with the log: `journalctl -u fprintd -n 50`.
 | Problem | What to do |
 |---|---|
 | `fprintd-list` shows no device | Run `sudo packaging/setup-fprintd.sh --status`; after moving or rebuilding the build directory, run `setup-fprintd.sh` again with its path. |
+| The examples already paired the key, but fprintd pairs again or fails to open | fprintd keeps its own pairing directory and cannot read your home directory. Copy the examples' pairing across: [docs/packaging.md](docs/packaging.md#storage-under-fprintd). |
 | "device did not return an image" | The tap was too short or too light; tap again. |
 | A finger matches only in some placements | Enroll it again with more varied placement. |
 | Many failed scans, low scores (e.g. after moving the key to another computer) | Recalibrate: delete `/var/lib/fprint/validity-0088-pairing/calibration.bin` (as root) and restart fprintd; the next scan calibrates (finger off). |
