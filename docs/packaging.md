@@ -17,17 +17,21 @@ too, e.g. in a container.
 1. **Dependencies.** Detects the distribution family from `/etc/os-release`
    (`ID`/`ID_LIKE`) and checks:
 
-   | Needed | Debian / Ubuntu / Mint | RHEL / Fedora / Alma / Rocky |
-   |---|---|---|
-   | git, meson ≥ the version libfprint asks for, ninja, C and C++ compiler (libfprint's meson project enables C++), pkg-config, python3 | `git meson ninja-build build-essential pkg-config python3` | `git meson ninja-build gcc gcc-c++ pkgconf-pkg-config python3` |
-   | glib-2.0, gio-unix-2.0, gobject-2.0, gmodule-2.0 | `libglib2.0-dev` | `glib2-devel` |
-   | gusb | `libgusb-dev` | `libgusb-devel` (RHEL 9/10 clones: CRB repository, like meson, ninja-build and gobject-introspection-devel) |
-   | OpenSSL ≥ 3.0 | `libssl-dev` | `openssl-devel` |
-   | gobject-introspection (`g-ir-scanner`, `.pc`) | `gobject-introspection libgirepository1.0-dev` | `gobject-introspection-devel` |
+   | Needed | Debian / Ubuntu / Mint | RHEL / Fedora / Alma / Rocky | Arch |
+   |---|---|---|---|
+   | git, meson ≥ the version libfprint asks for, ninja, C and C++ compiler (libfprint's meson project enables C++), pkg-config, python3 | `git meson ninja-build build-essential pkg-config python3` | `git meson ninja-build gcc gcc-c++ pkgconf-pkg-config python3` | `git meson ninja base-devel pkgconf python` |
+   | glib-2.0, gio-unix-2.0, gobject-2.0, gmodule-2.0, and `glib-mkenums` | `libglib2.0-dev` | `glib2-devel` | `glib2 glib2-devel` |
+   | gusb | `libgusb-dev` | `libgusb-devel` (RHEL 9/10 clones: CRB repository, like meson, ninja-build and gobject-introspection-devel) | `libgusb` |
+   | OpenSSL ≥ 3.0 | `libssl-dev` | `openssl-devel` | `openssl` |
+   | gobject-introspection (`g-ir-scanner`, `.pc`) | `gobject-introspection libgirepository1.0-dev` | `gobject-introspection-devel` | `gobject-introspection` |
 
-   Missing items are listed with the exact `apt-get`/`dnf` command, or
-   installed with `--install-deps`. Introspection is required because some
-   libfprint versions fail to configure without it.
+   Missing items are listed with the exact `apt-get`, `dnf` or `pacman`
+   command, or installed with `--install-deps`. On Arch, `--install-deps` runs
+   `pacman -S --needed --noconfirm` for the missing packages only; it never
+   syncs the package database (`pacman -Sy` alone is a partial upgrade). If
+   pacman cannot find a package, update the system with `sudo pacman -Syu`
+   first. Introspection is required because some libfprint versions fail to configure
+   without it.
 2. **libfprint.** Clones `https://gitlab.freedesktop.org/libfprint/libfprint.git`
    into `build/libfprint` and checks out the latest release tag (`v*`), or
    `--ref` (a tag or branch, e.g. `master`). `--no-update` keeps the checkout
@@ -49,15 +53,21 @@ too, e.g. in a container.
 Logs: `build/meson-setup.log`, `build/meson-compile.log`. `build/` is
 git-ignored. Tested with v1.94.100, v1.94.10 and master (2026-10).
 
-### Other distributions
+### Arch
 
-The script detects the Debian and RHEL families. Elsewhere, install the same
-tools and libraries yourself, then run it (it only checks what is present).
-Arch / CachyOS:
+To install by hand instead of with `--install-deps`: everything the script
+may install, plus `fprintd` for the service that `setup-fprintd.sh`
+configures (tested with fprintd 1.94.5):
 
 ```bash
-sudo pacman -S git meson ninja base-devel glib2 libgusb openssl gobject-introspection pkgconf python
+sudo pacman -S --needed base-devel git meson ninja python glib2 glib2-devel libgusb openssl gobject-introspection fprintd
 ```
+
+### Other distributions
+
+The script detects the Debian, RHEL and Arch families. Elsewhere, install the
+same tools and libraries yourself, then run it (it only checks what is
+present).
 
 ## Building by hand
 
@@ -184,7 +194,7 @@ Without systemd (OpenRC, runit …) the driver uses root's
 
 **Debian / Ubuntu / Mint:** `sudo pam-auth-update --enable fprintd`.
 
-**Arch / CachyOS** (by hand). First open a second TTY (Ctrl+Alt+F3) and log
+**Arch** (by hand). First open a second TTY (Ctrl+Alt+F3) and log
 in there, so you have a way back if something goes wrong. Then:
 
 ```bash

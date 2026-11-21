@@ -25,7 +25,7 @@ WITH_CLANG=0
 IMAGES=()
 if [ $# -eq 0 ]; then
     IMAGES=(ubuntu:24.04 debian:12 debian:13 fedora:42
-            rockylinux/rockylinux:9 rockylinux/rockylinux:10)
+            rockylinux/rockylinux:9 rockylinux/rockylinux:10 archlinux:latest)
     WITH_CLANG=1
 else
     for arg in "$@"; do

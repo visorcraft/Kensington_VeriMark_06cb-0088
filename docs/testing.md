@@ -32,7 +32,8 @@ weekly (to notice new libfprint releases):
   listed once in `meson-fragment.txt`, SPDX lines, no device or
   biometric data tracked, documentation links).
 - **Build and test** in containers: Ubuntu 24.04, Debian 12 and 13, Fedora
-  42, Rocky Linux 9 and 10, each against the latest libfprint release; Ubuntu also
+  42, Rocky Linux 9 and 10, Arch Linux (`archlinux:latest`), each against the
+  latest libfprint release; Ubuntu also
   against libfprint `master` (allowed to fail: an early warning about
   upstream changes) and once more with `CC=clang` (C++ stays `g++`). Clang
   rejects a `goto` that jumps past a `g_autofree` or `g_autoptr` variable;
@@ -57,7 +58,8 @@ v1.94.100), 80–150 s per distribution.
 
 `.github/ci/prepare-container.sh` holds the per-distribution preparation
 shared by both (certificates and git; on RHEL clones the CRB repository for
-`libgusb-devel` and `meson`).
+`libgusb-devel` and `meson`; on Arch a full `pacman -Syu`, since the image
+has no package database).
 
 What the tests cannot cover: anything with the sensor itself (USB, TLS
 session, capture, calibration on hardware, LED). Before a release, run the

@@ -13,9 +13,9 @@ No Windows driver, registry data or capture files are needed.
 
 | | Systems |
 |---|---|
-| Built and tested in CI | Ubuntu 24.04, Debian 12 and 13, Fedora 42, Rocky Linux 9 and 10 — against the latest libfprint release, plus clang on Ubuntu 24.04 ([details](docs/testing.md#continuous-integration)) |
-| Tested with the device | Linux Mint (Ubuntu 24.04 base) with fprintd 1.94.3 |
-| Should work | Other systemd-based distributions with libfprint ≥ 1.94; the build script installs dependencies on the Debian and RHEL families, elsewhere install them yourself ([Arch](docs/packaging.md#other-distributions)) |
+| Built and tested in CI | Ubuntu 24.04, Debian 12 and 13, Fedora 42, Rocky Linux 9 and 10, Arch Linux — against the latest libfprint release, plus clang on Ubuntu 24.04 ([details](docs/testing.md#continuous-integration)) |
+| Tested with the device | Linux Mint (Ubuntu 24.04 base) with fprintd 1.94.3; Arch Linux with fprintd 1.94.5 |
+| Should work | Other systemd-based distributions with libfprint ≥ 1.94; the build script installs dependencies on the Debian, RHEL and Arch families, elsewhere install them yourself ([docs](docs/packaging.md#other-distributions)) |
 
 The setup script for fprintd needs systemd. The driver itself also works on
 other init systems ([details](docs/packaging.md#storage-under-fprintd)).
@@ -35,6 +35,20 @@ Details: [calibration](docs/capture-program.md), [matcher](docs/matcher.md),
 [test results](docs/evaluation.md), [print encryption](docs/print-encryption.md).
 
 ## Installation
+
+### Arch Linux
+
+`--install-deps` below installs the missing build packages with `pacman`, but
+not `fprintd` itself. To install everything by hand:
+
+```bash
+sudo pacman -S --needed base-devel git meson ninja python glib2 glib2-devel libgusb openssl gobject-introspection fprintd
+```
+
+If pacman cannot find a package, update the system first
+(`sudo pacman -Syu`). Details: [docs/packaging.md](docs/packaging.md#arch).
+
+### Build and register with fprintd
 
 ```bash
 git clone https://github.com/visorcraft/Kensington_VeriMark_06cb-0088.git
@@ -98,6 +112,8 @@ Start with the log: `journalctl -u fprintd -n 50`.
 
 | Problem | What to do |
 |---|---|
+| `build-libfprint: missing: cmd:glib-mkenums` (or, building by hand, `meson setup` cannot find `glib-mkenums`) | On Arch install `glib2-devel` ([Arch Linux](#arch-linux)), or re-run the build script with `--install-deps`. |
+| `setup-fprintd.sh`: "fprintd.service is not installed" | Install the `fprintd` package, then run `setup-fprintd.sh` again. |
 | `fprintd-list` shows no device | Run `sudo packaging/setup-fprintd.sh --status`; after moving or rebuilding the build directory, run `setup-fprintd.sh` again with its path. |
 | The examples already paired the key, but fprintd pairs again or fails to open | fprintd keeps its own pairing directory and cannot read your home directory. Copy the examples' pairing across: [docs/packaging.md](docs/packaging.md#storage-under-fprintd). |
 | "device did not return an image" | The tap was too short or too light; tap again. |
