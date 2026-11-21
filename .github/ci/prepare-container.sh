@@ -27,6 +27,10 @@ case " ${ID:-} ${ID_LIKE:-} " in
             dnf install -y -q dnf-plugins-core
             dnf config-manager --set-enabled crb
         fi ;;
+    *" arch "*)
+        # The image ships without a package database. Sync it with a full
+        # upgrade (-Syu, never -Sy alone: partial upgrades are unsupported).
+        pacman -Syu --noconfirm --needed git python diffutils findutils which ;;
     *)
         echo "prepare-container: unsupported distribution ${ID:-?}" >&2
         exit 1 ;;

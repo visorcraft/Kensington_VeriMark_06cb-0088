@@ -55,6 +55,7 @@ jobs:
           # official "rockylinux" image stops at 9)
           - "rockylinux/rockylinux:9"
           - "rockylinux/rockylinux:10"
+          - "archlinux:latest"
         libfprint: [release]
         experimental: [false]
         cc: [gcc]
@@ -77,6 +78,7 @@ jobs:
         # bash and the scripts are not in the container before checkout
         run: |
           if command -v apt-get >/dev/null; then apt-get update -q && apt-get install -y -q git ca-certificates; \
+          elif command -v pacman >/dev/null; then pacman -Syu --noconfirm --needed git; \
           else dnf install -y -q git; fi
       - uses: actions/checkout@v4
       - name: Base packages

@@ -9,7 +9,8 @@
 #
 #   --ref <x>       libfprint tag or branch to build (default: the latest
 #                   release tag, e.g. v1.94.100; "master" for the newest code)
-#   --install-deps  install missing build dependencies with sudo apt/dnf
+#   --install-deps  install missing build dependencies with sudo apt-get,
+#                   dnf or pacman (Debian/RHEL/Arch families)
 #   --no-update     build the libfprint checkout as it is (no fetch/checkout)
 #   --clean         delete the build directory first (full rebuild)
 #
@@ -70,6 +71,7 @@ if [ -r /etc/os-release ]; then
     case " ${ID:-} ${ID_LIKE:-} " in
         *" debian "*|*" ubuntu "*)                     FAMILY=debian ;;
         *" rhel "*|*" fedora "*|*" centos "*)           FAMILY=rhel ;;
+        *" arch "*)                                     FAMILY=arch ;;   # Arch and ID_LIKE=arch derivatives
     esac
 fi
 
@@ -78,6 +80,7 @@ declare -A DEB=(
     [cmd:git]=git [cmd:meson]=meson [cmd:ninja]=ninja-build [cmd:cc]=build-essential
     [cmd:c++]=build-essential
     [cmd:pkg-config]=pkg-config [cmd:python3]=python3 [cmd:g-ir-scanner]=gobject-introspection
+    [cmd:glib-mkenums]=libglib2.0-dev
     [pc:glib-2.0]=libglib2.0-dev [pc:gio-unix-2.0]=libglib2.0-dev
     [pc:gobject-2.0]=libglib2.0-dev [pc:gmodule-2.0]=libglib2.0-dev
     [pc:gusb]=libgusb-dev [pc:openssl]=libssl-dev
@@ -88,14 +91,28 @@ declare -A RPM=(
     [cmd:c++]=gcc-c++
     [cmd:pkg-config]=pkgconf-pkg-config [cmd:python3]=python3
     [cmd:g-ir-scanner]=gobject-introspection-devel
+    [cmd:glib-mkenums]=glib2-devel
     [pc:glib-2.0]=glib2-devel [pc:gio-unix-2.0]=glib2-devel
     [pc:gobject-2.0]=glib2-devel [pc:gmodule-2.0]=glib2-devel
     [pc:gusb]=libgusb-devel [pc:openssl]=openssl-devel
     [pc:gobject-introspection-1.0]=gobject-introspection-devel
 )
+# Arch. base-devel brings gcc (C and C++) and pkgconf. Only the
+# packages for missing items are installed, with pacman -S --needed; no
+# "pacman -Sy" (a partial upgrade is unsafe on Arch).
+declare -A PAC=(
+    [cmd:git]=git [cmd:meson]=meson [cmd:ninja]=ninja [cmd:cc]=base-devel
+    [cmd:c++]=base-devel [cmd:pkg-config]=pkgconf [cmd:python3]=python
+    [cmd:g-ir-scanner]=gobject-introspection [cmd:glib-mkenums]=glib2-devel
+    [pc:glib-2.0]=glib2 [pc:gio-unix-2.0]=glib2
+    [pc:gobject-2.0]=glib2 [pc:gmodule-2.0]=glib2
+    [pc:gusb]=libgusb [pc:openssl]=openssl
+    [pc:gobject-introspection-1.0]=gobject-introspection
+)
 # libfprint's meson project also enables C++ (for an example), so a C++
 # compiler is needed even though the driver is C.
 CHECKS=(cmd:git cmd:meson cmd:ninja cmd:cc cmd:c++ cmd:pkg-config cmd:python3 cmd:g-ir-scanner
+        cmd:glib-mkenums
         pc:glib-2.0 pc:gio-unix-2.0 pc:gobject-2.0 pc:gmodule-2.0 pc:gusb pc:openssl
         pc:gobject-introspection-1.0)
 
@@ -116,8 +133,9 @@ if [ ${#MISSING[@]} -gt 0 ]; then
     PKGS=()
     for c in "${MISSING[@]}"; do
         case "$FAMILY" in
-            debian) p="${DEB[$c]}" ;;
-            rhel)   p="${RPM[$c]}" ;;
+            debian) p="${DEB[$c]:-}" ;;
+            rhel)   p="${RPM[$c]:-}" ;;
+            arch)   p="${PAC[$c]:-}" ;;
             *)      p="" ;;
         esac
         [ -n "$p" ] && [[ " ${PKGS[*]:-} " != *" $p "* ]] && PKGS+=("$p")
@@ -125,18 +143,26 @@ if [ ${#MISSING[@]} -gt 0 ]; then
     case "$FAMILY" in
         debian) CMD=("${SUDO[@]}" apt-get install -y "${PKGS[@]}") ;;
         rhel)   CMD=("${SUDO[@]}" dnf install -y "${PKGS[@]}") ;;
+        arch)   CMD=("${SUDO[@]}" pacman -S --needed "${PKGS[@]}") ;;
         *)      die "unknown distribution (${ID:-?}): install the tools and pkg-config modules above yourself" ;;
     esac
+    [ ${#PKGS[@]} -gt 0 ] || die "no $FAMILY package known for: ${MISSING[*]} (install it yourself)"
+    PACMAN_HINT="if pacman cannot find a package or its database is missing, update the system first: sudo pacman -Syu (not -Sy)"
     if [ "$INSTALL_DEPS" -eq 1 ]; then
         say "installing: ${PKGS[*]}"
-        [ "$FAMILY" = debian ] && "${SUDO[@]}" apt-get update -q
-        "${CMD[@]}"
+        case "$FAMILY" in
+            debian) "${SUDO[@]}" apt-get update -q; "${CMD[@]}" ;;
+            # --noconfirm like apt/dnf -y, so it also works without a terminal.
+            arch)   "${CMD[@]}" --noconfirm || die "pacman failed; $PACMAN_HINT, then re-run" ;;
+            *)      "${CMD[@]}" ;;
+        esac
         mapfile -t MISSING < <(missing_checks)
         [ ${#MISSING[@]} -eq 0 ] || die "still missing after install: ${MISSING[*]}"
     else
         say "install them with:"
         say "  ${CMD[*]}"
         [ "$FAMILY" = rhel ] && say "  (RHEL/Alma/Rocky: libgusb-devel and meson need the CRB repository, e.g. sudo dnf config-manager --set-enabled crb)"
+        [ "$FAMILY" = arch ] && say "  ($PACMAN_HINT)"
         die "or re-run with --install-deps"
     fi
 fi
